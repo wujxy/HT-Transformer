@@ -1,0 +1,78 @@
+mission_name: "ht_transformer_total_train"
+output_path: "output"
+detector_type: "CDWP"
+
+data:
+  h5_path: "/data/juno/wujxy/muon_reco/CDWP_HT_muon_rec/HT_train_h5/total_train"
+  # h5_path supports: directory (auto-discover *.h5), glob pattern, or single file path
+  h5_val_path: null                    # null = auto split from h5_path
+  geometry_cd: "/datafs/users/wujxy/muon_reco/muon_track_reco_CDWP/HT-Transformer/PMTPos_CD_LPMT.csv"
+  geometry_wp: "/datafs/users/wujxy/muon_reco/muon_track_reco_CDWP/HT-Transformer/PMTPos_WP_LPMT.csv"
+  h5_key_map:
+    copyno: "copyno"
+    charge: "charge"
+    time: "time"
+    nhits: "nhits"
+    enter_x: "tt_enter_x"
+    enter_y: "tt_enter_y"
+    enter_z: "tt_enter_z"
+    exit_x: "tt_exit_x"
+    exit_y: "tt_exit_y"
+    exit_z: "tt_exit_z"
+    track_time: "track_time"
+  max_hits: 20012
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  nside: 8
+  num_time_bins: 32
+  t_max: 800.0                         # ns, based on p99≈620 ns from data
+  auto_t_max: false                    # if true, estimate from data p99
+  preprocess_batch_size: 512
+  # dataloader settings
+  num_workers: 16
+  prefetch_factor: 2
+
+model:
+  d_model: 96
+  num_layers: 4
+  num_heads: 4
+  d_ff: 512
+  num_queries: 2
+  num_global_tokens: 8
+  cd_knn_k: 16
+  abs_posenc: "fourier"
+  rel_posenc: "bucket"
+  patch_time_encoder: "conv1d"
+  num_rpe_angle_buckets: 64
+  num_rpe_time_buckets: 64
+  fourier_freq: 32
+  dropout: 0.1
+
+loss:
+  lambda_ang: 1.0
+  lambda_len: 0.5
+  lambda_dir: 0.25
+
+train:
+  optimizer: "adamw"
+  lr: 5.0e-5
+  weight_decay: 1.0e-2
+  scheduler: "cosine_with_warmup"
+  warmup_steps: 500
+  precision: "bf16"
+  dropout: 0.1
+  grad_clip: 1.0
+  batch_size: 64
+  num_epochs: 200
+  save_every: 50
+  eval_every: 10
+  use_accelerate: true
+  gradient_accumulation_steps: 2    # effective batch = batch_size * num_gpus * grad_accum
+  seed: 42
+
+augmentation:
+  rotation_expand_times: 0             # 0=off, 1=2x data, 2=3x data, ...
+  use_time_jitter: false
+  use_drop_hits: false
+  use_noise_injection: false

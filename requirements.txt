@@ -1,0 +1,31 @@
+# HT-Transformer Endpoint Reconstruction — Dependencies
+# Python >= 3.8
+
+# Core deep learning
+torch>=2.0.0
+
+# Data & I/O
+h5py>=3.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+
+# HEALPix patch mapping
+healpy>=1.15.0
+
+# Configuration
+pyyaml>=5.0
+
+# Logging
+loguru>=0.6.0
+
+# Progress bar
+tqdm>=4.60.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Mixed precision (usually bundled with torch, but explicit)
+# torch.amp is part of PyTorch >= 1.6
+
+# Multi-GPU training
+accelerate>=0.20.0

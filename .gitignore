@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# PyTorch / Deep Learning
+*.pth
+*.pt
+*.ckpt
+*.bin
+checkpoints/
+*.safetensors
+
+# Accelerate
+.accelerate/
+accelerate-launch*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Data files
+*.h5
+*.hdf5
+# *.csv
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# Logs
+*.log
+logs/
+*.log.*
+wandb/
+mlruns/
+
+# Outputs
+output/
+outputs/
+runs/
+results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
