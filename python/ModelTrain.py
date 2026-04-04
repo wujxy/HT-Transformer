@@ -280,11 +280,54 @@ class Trainer:
             self._cd_knn_adj_tensor = torch.from_numpy(adj).long()
         return self._cd_knn_adj_tensor[:N_cd].to(self.device)
 
+    def _verify_gradient_flow(self):
+        """Verify that all model parameters receive gradients during backward pass."""
+        logger.info("Verifying gradient flow...")
+        self.model.train()
+
+        # Get a single batch for testing
+        test_batch = None
+        for batch in self.train_loader:
+            test_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                         for k, v in batch.items()}
+            N_cd = test_batch['cd_unit_vecs'].shape[1]
+            test_batch['cd_knn_adj'] = self._get_knn_adj_tensor(N_cd)
+            break
+
+        if test_batch is None:
+            logger.warning("Could not get batch for gradient verification")
+            return
+
+        # Forward pass
+        outputs = self.model(test_batch)
+        loss, _ = self.criterion(outputs['pred_u1'], outputs['pred_u2'],
+                                  test_batch['u1'], test_batch['u2'])
+
+        # Backward pass
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # Check gradients
+        unused = [name for name, p in self.model.named_parameters()
+                 if p.grad is None and p.requires_grad]
+
+        if unused:
+            logger.warning(f"⚠ Parameters without gradients ({len(unused)}): {unused[:5]}...")
+            logger.warning("find_unused_parameters=True is still needed")
+        else:
+            logger.info("✓ All parameters have gradients - find_unused_parameters=False is safe")
+
+        # Clean up
+        self.optimizer.zero_grad()
+
     def run(self):
         """Execute full training loop."""
         logger.info("=" * 50)
         logger.info("Starting training...")
         logger.info("=" * 50)
+
+        # Verify gradient flow before training starts (all ranks must run to keep DDP in sync)
+        self._verify_gradient_flow()
 
         num_epochs = self.train_cfg['num_epochs']
         eval_every = self.train_cfg.get('eval_every', 10)
@@ -384,15 +427,6 @@ class Trainer:
                         self.optimizer.step()
                         self.scheduler.step()
                         self.optimizer.zero_grad()
-
-                        # Debug: Check if all parameters have gradients (first step only)
-                        if self.global_step == 1 and self._is_main:
-                            unused = [name for name, p in self.model.named_parameters()
-                                     if p.grad is None and p.requires_grad]
-                            if unused:
-                                logger.warning(f"Parameters without grad: {unused}")
-                            else:
-                                logger.info("✓ All parameters have gradients - find_unused_parameters=False is safe")
             else:
                 with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(batch)

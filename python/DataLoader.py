@@ -514,20 +514,16 @@ def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,
     if use_accelerate:
         num_workers = 0
         prefetch = None
-        # Use DistributedSampler for proper data distribution across processes
-        train_sampler = DistributedSampler(train_ds, shuffle=True)
-        val_sampler = DistributedSampler(val_ds, shuffle=False)
-        test_sampler = DistributedSampler(test_ds, shuffle=False)
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler,
+        # Let accelerator.handle data distribution automatically
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                   collate_fn=collate_fn, num_workers=num_workers,
                                   pin_memory=True, persistent_workers=num_workers > 0,
                                   prefetch_factor=prefetch)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler,
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                 collate_fn=collate_fn, num_workers=num_workers,
                                 pin_memory=True, persistent_workers=num_workers > 0,
                                 prefetch_factor=prefetch)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, sampler=test_sampler,
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                                  collate_fn=collate_fn, num_workers=num_workers,
                                  pin_memory=True, persistent_workers=num_workers > 0,
                                  prefetch_factor=prefetch)

@@ -322,6 +322,20 @@ class HybridEncoderLayer(nn.Module):
         return self.rpe(angles, dt)
 
 
+def _masked_mean(emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean over dim=1 ignoring padded positions.
+
+    Args:
+        emb: (B, N, D)
+        mask: (B, N) bool, True = padding
+
+    Returns:
+        (B, D)
+    """
+    valid = (~mask).float().unsqueeze(-1)  # (B, N, 1)
+    return (emb * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+
+
 class EndpointHead(nn.Module):
     """
     Predicts a single unit vector endpoint from a query token.
@@ -487,11 +501,13 @@ class HTTransformer(nn.Module):
 
         # --- Output heads ---
         # query_emb: (B, num_queries=2, D)
-        # Fuse global context to ensure global_tokens participate in loss computation
-        global_context = global_emb.mean(dim=1)  # (B, D) aggregate global information
+        # Aggregate context from all token groups for prediction heads
+        global_context = global_emb.mean(dim=1)                          # (B, D)
+        global_context = global_context + _masked_mean(wp_emb, batch['wp_mask'])
+        global_context = global_context + _masked_mean(cd_emb, batch['cd_mask'])
 
-        q1 = query_emb[:, 0, :] + global_context  # (B, D) query + global context
-        q2 = query_emb[:, 1, :] + global_context  # (B, D) query + global context
+        q1 = query_emb[:, 0, :] + global_context  # (B, D)
+        q2 = query_emb[:, 1, :] + global_context  # (B, D)
 
         pred_u1 = self.head1(q1)  # (B, 3) unit vector
         pred_u2 = self.head2(q2)  # (B, 3) unit vector
