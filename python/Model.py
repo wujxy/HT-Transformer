@@ -487,8 +487,11 @@ class HTTransformer(nn.Module):
 
         # --- Output heads ---
         # query_emb: (B, num_queries=2, D)
-        q1 = query_emb[:, 0, :]  # (B, D)
-        q2 = query_emb[:, 1, :]  # (B, D)
+        # Fuse global context to ensure global_tokens participate in loss computation
+        global_context = global_emb.mean(dim=1)  # (B, D) aggregate global information
+
+        q1 = query_emb[:, 0, :] + global_context  # (B, D) query + global context
+        q2 = query_emb[:, 1, :] + global_context  # (B, D) query + global context
 
         pred_u1 = self.head1(q1)  # (B, 3) unit vector
         pred_u2 = self.head2(q2)  # (B, 3) unit vector

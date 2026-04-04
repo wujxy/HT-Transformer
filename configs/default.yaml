@@ -63,7 +63,7 @@ train:
   precision: "bf16"
   dropout: 0.1
   grad_clip: 1.0
-  batch_size: 64
+  batch_size: 32
   num_epochs: 200
   save_every: 50
   eval_every: 10

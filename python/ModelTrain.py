@@ -80,7 +80,7 @@ class Trainer:
             self.accelerator = Accelerator(
                 gradient_accumulation_steps=grad_accum,
                 mixed_precision=mp,
-                kwargs_handlers=[DDPInit(find_unused_parameters=True)],
+                kwargs_handlers=[DDPInit(find_unused_parameters=False)],
             )
             self.device = self.accelerator.device
             logger.info(f"Accelerator initialized: device={self.device}, "
@@ -384,6 +384,15 @@ class Trainer:
                         self.optimizer.step()
                         self.scheduler.step()
                         self.optimizer.zero_grad()
+
+                        # Debug: Check if all parameters have gradients (first step only)
+                        if self.global_step == 1 and self._is_main:
+                            unused = [name for name, p in self.model.named_parameters()
+                                     if p.grad is None and p.requires_grad]
+                            if unused:
+                                logger.warning(f"Parameters without grad: {unused}")
+                            else:
+                                logger.info("✓ All parameters have gradients - find_unused_parameters=False is safe")
             else:
                 with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(batch)
