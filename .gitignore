@@ -35,7 +35,7 @@ checkpoints/
 *.safetensors
 
 # Accelerate
-.accelerate/
+# .accelerate/
 accelerate-launch*
 
 # Jupyter Notebook
