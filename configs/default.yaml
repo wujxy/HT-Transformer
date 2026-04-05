@@ -46,11 +46,16 @@ model:
   wp_geo_hidden: 32
   wp_qt_hidden: 32
   wp_projector_hidden: 64
-  # WP time bias
-  wp_time_bias: "signed_bucket"
-  wp_num_time_buckets: 64
-  wp_time_bias_heads_shared: true  # cheaper for large N_wp
-  wp_time_bias_layers: 1           # only apply to first k layers (0 = disabled, allows SDPA fast path)
+  # WP time encoding (SDPA-compatible, replaces pairwise time bias)
+  wp_time_encoding: true
+  wp_time_hidden: 32
+  wp_time_fourier_dim: 16
+
+  # Note: Old pairwise time bias config is deprecated
+  # wp_time_bias: "signed_bucket"       # DEPRECATED
+  # wp_num_time_buckets: 64             # DEPRECATED
+  # wp_time_bias_heads_shared: true     # DEPRECATED
+  # wp_time_bias_layers: 1               # DEPRECATED
   # CD DeepSphere
   cd_deepsphere_layers: 4
   cd_deepsphere_hidden: 256

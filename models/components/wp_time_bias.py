@@ -1,8 +1,25 @@
 """
 WP Time Bias module for injecting signed relative time bias into WP self-attention.
 
+**DEPRECATION NOTICE:**
+This module is deprecated for the main training path. It builds explicit pairwise
+bias tensors of shape (B, H, N, N) which prevents using SDPA/FlashAttention fast path.
+
+For new training, use WPTimeEncoding (token-level time encoding) instead,
+which is fully SDPA-compatible and significantly faster.
+
+This module is kept for:
+- Legacy compatibility
+- Ablation studies
+- Research experiments
+
 Provides:
 - SignedTimeBucketBias: Converts relative time differences to bucketed bias values
+
+Performance Warning:
+- Explicit (B, H, N, N) bias tensors are memory and compute intensive
+- Disables SDPA fast path, falling back to manual attention
+- Consider using token-level time encoding (WPTimeEncoding) for production
 """
 
 import torch
@@ -15,6 +32,13 @@ class SignedTimeBucketBias(nn.Module):
     """
     Signed relative time bias for WP self-attention.
 
+    **DEPRECATED for main training path.** Use WPTimeEncoding instead.
+
+    This module builds explicit (B, num_heads, N_wp, N_wp) bias tensors which:
+    - Are memory intensive for large N_wp
+    - Prevent using SDPA/FlashAttention fast path
+    - Require manual attention computation
+
     Converts time differences between WP hits into bucketed bias values
     that can be added to attention logits.
 
@@ -25,6 +49,9 @@ class SignedTimeBucketBias(nn.Module):
 
     Input: wp_times (B, N_wp)
     Output: time_bias (B, num_heads, N_wp, N_wp)
+
+    For production use, prefer WPTimeEncoding which uses token-level encoding
+    and is fully SDPA-compatible.
     """
 
     def __init__(self, num_buckets: int = 64, num_heads: int = 4,

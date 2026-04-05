@@ -30,11 +30,16 @@ from models.components.token_projectors import (
     TOKEN_WP, TOKEN_CD, TOKEN_GLOBAL, TOKEN_QUERY,
 )
 from models.components.deepsphere import DeepSphereEncoder, CDCompression, build_healpix_knn_adjacency, RMSNorm
-from models.components.wp_time_bias import SignedTimeBucketBias
+from models.components.wp_time_encoding import WPTimeEncoding
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention with optional mask and time bias."""
+    """
+    Multi-head attention using SDPA (FlashAttention) fast path.
+
+    This implementation only supports the SDPA path for optimal performance.
+    The explicit pairwise time bias has been replaced by token-level time encoding.
+    """
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -42,7 +47,6 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scale = self.head_dim ** -0.5
 
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
@@ -51,8 +55,17 @@ class MultiHeadAttention(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                mask: Optional[torch.Tensor] = None,
-                time_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            query: (B, Sq, D)
+            key: (B, Sk, D)
+            value: (B, Sk, D)
+            mask: Optional attention mask
+
+        Returns:
+            (B, Sq, D)
+        """
         B, Sq, _ = query.shape
         _, Sk, _ = key.shape
 
@@ -60,34 +73,19 @@ class MultiHeadAttention(nn.Module):
         k = self.wk(key).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.wv(value).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if time_bias is None:
-            # SDPA path: FlashAttention / memory-efficient backend
-            attn_mask = None
-            if mask is not None:
-                if mask.dim() == 3:
-                    mask = mask.unsqueeze(1)
-                attn_mask = torch.zeros_like(mask, dtype=q.dtype)
-                attn_mask.masked_fill_(mask, float('-inf'))
+        # SDPA path: FlashAttention / memory-efficient backend
+        attn_mask = None
+        if mask is not None:
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            attn_mask = torch.zeros_like(mask, dtype=q.dtype)
+            attn_mask.masked_fill_(mask, float('-inf'))
 
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-        else:
-            # Manual path: with additive time bias
-            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            scores = scores + time_bias
-
-            if mask is not None:
-                if mask.dim() == 3:
-                    mask = mask.unsqueeze(1)
-                scores = scores.masked_fill(mask, float('-inf'))
-
-            attn = F.softmax(scores, dim=-1)
-            attn = attn.nan_to_num(0.0)
-            attn = self.attn_drop(attn)
-            out = torch.matmul(attn, v)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, Sq, self.d_model)
         return self.wo(out)
@@ -115,23 +113,22 @@ class HybridFusionLayer(nn.Module):
     Hybrid Fusion Layer for V2.
 
     Features:
-    - WP self-attention with optional time bias
+    - WP self-attention (SDPA-compatible)
     - WP↔CD cross-attention (bidirectional)
     - Global↔All attention
     - Query↔All attention
 
     Note: CD self-attention is handled by DeepSphereEncoder before this layer.
+    Note: WP time bias has been replaced by token-level time encoding for SDPA compatibility.
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
                  num_global: int, num_queries: int,
-                 use_wp_time_bias: bool = False,
                  dropout: float = 0.1, norm_type: str = 'layernorm'):
         super().__init__()
         self.d_model = d_model
-        self.use_wp_time_bias = use_wp_time_bias
 
-        # Attention modules
+        # Attention modules (all SDPA-compatible)
         self.wp_self_attn = MultiHeadAttention(d_model, num_heads, dropout)
         self.wp_cd_cross = MultiHeadAttention(d_model, num_heads, dropout)
         self.cd_wp_cross = MultiHeadAttention(d_model, num_heads, dropout)
@@ -158,19 +155,18 @@ class HybridFusionLayer(nn.Module):
 
     def forward(self, wp_emb: torch.Tensor, cd_emb: torch.Tensor,
                 global_emb: torch.Tensor, query_emb: torch.Tensor,
-                wp_mask: torch.Tensor, cd_mask: torch.Tensor,
-                wp_time_bias: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+                wp_mask: torch.Tensor, cd_mask: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         B = wp_emb.shape[0]
         N_wp = wp_emb.shape[1]
         N_cd = cd_emb.shape[1]
         M = global_emb.shape[1]
         Q = query_emb.shape[1]
 
-        # 1. WP self-attention (with optional time bias)
+        # 1. WP self-attention (SDPA-compatible, no explicit time bias)
         wp_normed = self.wp_attn_norm(wp_emb)
         wp_attn_mask = wp_mask.unsqueeze(1) | wp_mask.unsqueeze(2)
         wp_out = wp_emb + self.wp_self_attn(wp_normed, wp_normed, wp_normed,
-                                            mask=wp_attn_mask, time_bias=wp_time_bias)
+                                            mask=wp_attn_mask)
 
         # 2. WP↔CD cross-attention (bidirectional)
         wp_cross_in = self.wp_cross_norm(wp_out)
@@ -250,21 +246,15 @@ class HTTransformer(nn.Module):
         self.num_time_bins = data_cfg['num_time_bins']
         self.norm_type = model_cfg.get('norm_type', 'layernorm')
 
-        # WP time bias module
-        wp_time_bias_type = model_cfg.get('wp_time_bias', 'signed_bucket')
-        if wp_time_bias_type == 'signed_bucket':
-            self.wp_time_bias = SignedTimeBucketBias(
-                num_buckets=model_cfg.get('wp_num_time_buckets', 64),
-                num_heads=model_cfg['num_heads'],
-                heads_shared=model_cfg.get('wp_time_bias_heads_shared', False),
-                max_time=1.0,
+        # WP time encoding module (replaces pairwise time bias for SDPA compatibility)
+        if model_cfg.get('wp_time_encoding', True):
+            self.wp_time_encoding = WPTimeEncoding(
+                d_model=self.d_model,
+                hidden=model_cfg.get('wp_time_hidden', 32),
+                fourier_dim=model_cfg.get('wp_time_fourier_dim', 16),
             )
         else:
-            self.wp_time_bias = None
-
-        # WP time bias: only apply to first k layers (default: all layers)
-        # This allows later layers to use SDPA fast path
-        self.wp_time_bias_layers = model_cfg.get('wp_time_bias_layers', self.num_layers)
+            self.wp_time_encoding = None
 
         # Token projectors
         self.wp_projector = WPProjector(
@@ -328,7 +318,6 @@ class HTTransformer(nn.Module):
                 d_ff=model_cfg['d_ff'],
                 num_global=self.num_global,
                 num_queries=self.num_queries,
-                use_wp_time_bias=(self.wp_time_bias is not None),
                 dropout=model_cfg.get('dropout', 0.1),
                 norm_type=self.norm_type,
             )
@@ -351,6 +340,13 @@ class HTTransformer(nn.Module):
 
         # Project tokens
         wp_emb = self.wp_projector(batch['wp_tokens'])
+
+        # Add token-level time encoding (SDPA-compatible, replaces pairwise time bias)
+        if self.wp_time_encoding is not None:
+            wp_times = batch.get('wp_times', None)
+            if wp_times is not None:
+                wp_emb = wp_emb + self.wp_time_encoding(wp_times)
+
         cd_emb = self.cd_projector(
             batch['cd_unit_vecs'], batch['cd_stats'], batch['cd_time_bins']
         )
@@ -376,36 +372,27 @@ class HTTransformer(nn.Module):
         global_emb = global_emb + self.type_embedding(global_type)
         query_emb = query_emb + self.type_embedding(query_type)
 
-        # DeepSphere encoding + Compression
+        # DeepSphere encoding + Compression (Stage B: fixed graph, no runtime construction)
         cd_pixel_ids = batch.get('cd_pixel_ids', None)
+        cd_mask_input = batch.get('cd_mask', None)
+
+        # CD encoder: works on fixed HEALPix grid with precomputed kNN adjacency
         cd_emb = self.cd_encoder(
             cd_emb,
-            pixel_ids=cd_pixel_ids,
-            full_knn_adj=self.cd_knn_adj,
-            cd_mask=batch.get('cd_mask', None),
+            knn_adj=self.cd_knn_adj,
+            mask=cd_mask_input,
         )
-        cd_emb, cd_pixel_ids_fused = self.cd_compression(
-            cd_emb, pixel_ids=cd_pixel_ids, mask=batch['cd_mask'])
-        cd_mask = (cd_emb.abs().sum(dim=-1) == 0) if cd_pixel_ids_fused is None else \
-                  (cd_pixel_ids_fused == -1)
 
-        # Compute WP time bias if enabled (once, reused across layers)
-        wp_time_bias = None
-        if self.wp_time_bias is not None:
-            wp_times_input = batch.get('wp_times', None)
-            if wp_times_input is not None:
-                wp_time_bias = self.wp_time_bias(wp_times_input)
+        # CD compression: fixed dense grid -> fixed low-res grid
+        cd_emb, cd_pixel_ids_fused, cd_mask = self.cd_compression(
+            cd_emb, pixel_ids=cd_pixel_ids, mask=cd_mask_input, return_mask=True)
 
-        # Encoder layers with time bias only applied to first k layers
-        for layer_idx, layer in enumerate(self.encoder_layers):
-            # Only apply time bias to first wp_time_bias_layers layers
-            layer_wp_time_bias = wp_time_bias if layer_idx < self.wp_time_bias_layers else None
-
+        # Encoder layers (all use SDPA-compatible attention)
+        for layer in self.encoder_layers:
             wp_emb, cd_emb, global_emb, query_emb = layer(
                 wp_emb, cd_emb, global_emb, query_emb,
                 wp_mask=batch['wp_mask'],
                 cd_mask=cd_mask,
-                wp_time_bias=layer_wp_time_bias,
             )
 
         # Output heads

@@ -94,13 +94,15 @@ def build_local_neighbor_graph(
 
 class DeepSphereBlock(nn.Module):
     """
-    DeepSphere block for local spherical feature aggregation.
+    DeepSphere block for local spherical feature aggregation on fixed HEALPix grid.
 
-    Uses kNN neighborhood on HEALPix sphere for message passing.
+    Stage B optimization: Runs on fixed graph topology where node index = HEALPix pixel id.
+    All events share the same graph structure, eliminating runtime local graph construction.
+
     Structure: Pre-LN -> LocalConv -> GELU -> Residual
 
-    Input: (B, N_cd, D)
-    Output: (B, N_cd, D)
+    Input: (B, npix, D) where npix is fixed HEALPix grid size (e.g., 768 for nside=8)
+    Output: (B, npix, D)
     """
 
     def __init__(self, d_model: int, hidden_dim: int, k_neighbors: int = 16,
@@ -141,7 +143,7 @@ class DeepSphereBlock(nn.Module):
 
         Args:
             x: (B, N, D) input features
-            neighbor_indices: (B, N, k) local neighbor indices
+            neighbor_indices: (B, N, k) or (N, k) local neighbor indices
             valid_mask: (B, N, k) bool mask, True = valid neighbor
 
         Returns:
@@ -150,8 +152,12 @@ class DeepSphereBlock(nn.Module):
         B, N, D = x.shape
         k = neighbor_indices.shape[-1]
 
-        # Vectorized gather: replace -1 with 0 to avoid index error, then mask
-        safe_indices = neighbor_indices.clamp(min=0)  # (B, N, k)
+        # Handle fixed global neighbor indices (N, k) -> (B, N, k)
+        if neighbor_indices.dim() == 2:
+            neighbor_indices = neighbor_indices.unsqueeze(0).expand(B, -1, -1)
+
+        # Vectorized gather: clamp indices to avoid out-of-bounds
+        safe_indices = neighbor_indices.clamp(min=0, max=N-1)  # (B, N, k)
 
         # Expand x for gathering: (B, N, D) -> (B, N, k, D)
         x_expand = x.unsqueeze(2).expand(B, N, k, D)
@@ -173,26 +179,30 @@ class DeepSphereBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        local_neighbor_indices: Optional[torch.Tensor] = None,
-        valid_neighbor_mask: Optional[torch.Tensor] = None,
+        knn_adj: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            x: (B, N_cd, D) input CD patch embeddings
-            local_neighbor_indices: (B, N_cd, k) local neighbor indices
-            valid_neighbor_mask: (B, N_cd, k) bool mask for valid neighbors
+            x: (B, npix, D) input CD patch embeddings on fixed HEALPix grid
+            knn_adj: (npix, k) global kNN adjacency table (fixed for all batches)
+            mask: (B, npix) bool mask, True = padding (no data at this pixel)
 
         Returns:
-            (B, N_cd, D) output embeddings
+            (B, npix, D) output embeddings
         """
         # Pre-LN
         x_norm = self.norm(x)
 
-        if local_neighbor_indices is not None:
-            # Local aggregation with precomputed kNN indices
-            neighbor_agg = self._aggregate_neighbors(
-                x_norm, local_neighbor_indices, valid_neighbor_mask
-            )
+        if knn_adj is not None:
+            # Build valid neighbor mask from node mask if provided
+            valid_mask = None
+            if mask is not None:
+                # (B, N) -> (B, N, 1) -> (B, N, k) indicating which neighbors are valid
+                valid_mask = ~mask.unsqueeze(-1).expand(-1, -1, self.k_neighbors)
+
+            # Local aggregation with fixed kNN adjacency (no per-batch remapping needed)
+            neighbor_agg = self._aggregate_neighbors(x_norm, knn_adj, valid_mask)
         else:
             # Fallback: global mean pooling (for compatibility)
             neighbor_agg = x_norm.mean(dim=1, keepdim=True).expand_as(x_norm)
@@ -209,10 +219,13 @@ class DeepSphereBlock(nn.Module):
 
 class DeepSphereEncoder(nn.Module):
     """
-    DeepSphere encoder: stack of DeepSphereBlocks.
+    DeepSphere encoder: stack of DeepSphereBlocks on fixed HEALPix grid.
 
-    Input: (B, N_cd, D)
-    Output: (B, N_cd, D)
+    Stage B optimization: Works on fixed graph topology without runtime local graph construction.
+    Input and output have fixed shape (B, npix, D) where npix corresponds to HEALPix grid size.
+
+    Input: (B, npix, D) dense HEALPix grid embeddings
+    Output: (B, npix, D)
     """
 
     def __init__(self, d_model: int, num_layers: int = 4, hidden_dim: int = 256,
@@ -229,38 +242,24 @@ class DeepSphereEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        pixel_ids: Optional[torch.Tensor] = None,
-        full_knn_adj: Optional[torch.Tensor] = None,
-        cd_mask: Optional[torch.Tensor] = None,
+        knn_adj: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            x: (B, N_cd, D) input embeddings
-            pixel_ids: (B, N_cd) HEALPix pixel IDs
-            full_knn_adj: (npix, k) global kNN adjacency table
-            cd_mask: (B, N_cd) bool mask, True = padding
+            x: (B, npix, D) input embeddings on fixed HEALPix grid
+            knn_adj: (npix, k) global kNN adjacency table (fixed for all batches)
+            mask: (B, npix) bool mask, True = padding (no data at this pixel)
 
         Returns:
-            (B, N_cd, D) encoded embeddings
+            (B, npix, D) encoded embeddings
         """
-        # Build local neighbor graph once per batch (not per block)
-        local_neighbor_indices = None
-        valid_neighbor_mask = None
-
-        if full_knn_adj is not None and pixel_ids is not None:
-            local_neighbor_indices, valid_neighbor_mask = build_local_neighbor_graph(
-                pixel_ids=pixel_ids,
-                full_knn_adj=full_knn_adj,
-                cd_mask=cd_mask,
-                padding_value=-1,
-            )
+        # Stage B: No runtime local graph construction needed
+        # The graph is fixed: node index = HEALPix pixel id
+        # knn_adj is directly used by all blocks without per-batch remapping
 
         for block in self.blocks:
-            x = block(
-                x,
-                local_neighbor_indices=local_neighbor_indices,
-                valid_neighbor_mask=valid_neighbor_mask,
-            )
+            x = block(x, knn_adj=knn_adj, mask=mask)
         return x
 
 
@@ -425,6 +424,84 @@ class CDCompression(nn.Module):
 
         return pooled_padded, pixel_ids_padded
 
+    def _healpix_pool_dense(
+        self,
+        x: torch.Tensor,
+        pixel_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Pool high-resolution HEALPix patches to fixed dense low-resolution grid.
+
+        This is the optimized version that returns fixed-shape tensors suitable
+        for SDPA-compatible attention. Unlike _healpix_pool, this does not
+        compact active tokens - it returns a dense (B, npix_out, D) tensor.
+
+        Args:
+            x: (B, N_cd, D) patch embeddings
+            pixel_ids: (B, N_cd) pixel IDs (in high-res nside)
+            mask: (B, N_cd) bool mask, True = padding token to ignore
+
+        Returns:
+            pooled: (B, npix_out, D) pooled embeddings (dense fixed grid)
+            pixel_ids_out: (B, npix_out) low-res pixel IDs, padding = -1
+            cd_mask_out: (B, npix_out) bool mask, True = padding (no hits)
+        """
+        B, N, D = x.shape
+        npix_out = int(self.npix_out.item())
+
+        if self.high_to_low is None:
+            # Fallback: mean pooling to target_tokens
+            out = x.mean(dim=1, keepdim=True).expand(B, self.target_tokens, D)
+            pixel_ids_out = torch.arange(self.target_tokens, device=x.device).view(1, -1).expand(B, -1)
+            cd_mask = torch.zeros(B, self.target_tokens, dtype=torch.bool, device=x.device)
+            return out, pixel_ids_out, cd_mask
+
+        # Map high-res pixel IDs to low-res
+        pixel_ids_flat = pixel_ids.view(-1).clamp(0, len(self.high_to_low) - 1)
+        low_ids = self.high_to_low[pixel_ids_flat].view(B, N)
+
+        # Create batch offsets for flattened indexing
+        # Each batch item's low-res pixels are at offset: batch_idx * npix_out
+        batch_offsets = (torch.arange(B, device=x.device) * npix_out).view(B, 1)
+        bins = low_ids + batch_offsets  # (B, N)
+
+        # Valid tokens mask
+        if mask is None:
+            valid = torch.ones(B, N, dtype=torch.bool, device=x.device)
+        else:
+            valid = ~mask
+
+        bins_valid = bins[valid]  # (N_valid,)
+        x_valid = x[valid]        # (N_valid, D)
+
+        # Flattened output buffers: (B * npix_out, D)
+        out = torch.zeros(B * npix_out, D, device=x.device, dtype=x.dtype)
+        counts = torch.zeros(B * npix_out, device=x.device, dtype=x.dtype)
+
+        # Scatter add: accumulate features for each low-res pixel
+        out.index_add_(0, bins_valid, x_valid)
+        counts.index_add_(0, bins_valid, torch.ones_like(bins_valid, dtype=x.dtype))
+
+        # Average by count (avoid div by zero)
+        nonzero = counts > 0
+        safe_counts = counts.clamp(min=1.0)
+        out = out / safe_counts.unsqueeze(-1)
+
+        # Reshape to (B, npix_out, D)
+        out = out.view(B, npix_out, D)
+        counts = counts.view(B, npix_out)
+
+        # Create mask: True where no hits were pooled (count == 0)
+        cd_mask_out = ~nonzero.view(B, npix_out)
+
+        # Pixel IDs for the fixed grid
+        pixel_ids_out = torch.arange(npix_out, device=x.device).view(1, npix_out).expand(B, -1)
+        # Masked positions get -1
+        pixel_ids_out = pixel_ids_out.masked_fill(cd_mask_out, -1)
+
+        return out, pixel_ids_out, cd_mask_out
+
     def _attention_pool(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Learnable attention-based pooling."""
         B = x.shape[0]
@@ -449,25 +526,42 @@ class CDCompression(nn.Module):
         return self.pool_proj(x_reshaped.mean(dim=2))
 
     def forward(self, x: torch.Tensor, pixel_ids: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                mask: Optional[torch.Tensor] = None,
+                return_mask: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             x: (B, N_cd, D) CD patch embeddings
             pixel_ids: (B, N_cd) pixel IDs for HEALPix pooling
             mask: (B, N_cd) bool mask, True = padding
+            return_mask: If True, also return the output mask
 
         Returns:
             pooled: (B, N_out, D) compressed embeddings
             pixel_ids_out: (B, N_out) or None
+            mask_out: (B, N_out) or None, bool mask where True = padding
         """
         if self.method == 'healpix_pool':
             if pixel_ids is None:
                 raise ValueError("healpix_pool method requires pixel_ids")
-            return self._healpix_pool(x, pixel_ids, mask=mask)
+            # Use dense pooling for fixed-shape output (SDPA-compatible)
+            pooled, pixel_ids_out, mask_out = self._healpix_pool_dense(x, pixel_ids, mask=mask)
+            if return_mask:
+                return pooled, pixel_ids_out, mask_out
+            return pooled, pixel_ids_out, None
         elif self.method == 'attention_pool':
-            return self._attention_pool(x, mask), None
+            pooled = self._attention_pool(x, mask)
+            # For attention_pool, we don't have explicit pixel IDs
+            if return_mask:
+                # mask indicates valid positions in the target space
+                return pooled, None, torch.zeros(pooled.shape[0], pooled.shape[1],
+                                                  dtype=torch.bool, device=pooled.device)
+            return pooled, None, None
         elif self.method == 'mean_pool':
-            return self._mean_pool(x, self.target_tokens), None
+            pooled = self._mean_pool(x, self.target_tokens)
+            if return_mask:
+                return pooled, None, torch.zeros(pooled.shape[0], pooled.shape[1],
+                                                  dtype=torch.bool, device=pooled.device)
+            return pooled, None, None
         else:
             raise ValueError(f"Unknown compression method: {self.method}")
 
