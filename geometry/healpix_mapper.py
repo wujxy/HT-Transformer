@@ -130,6 +130,21 @@ class HEALPixMapper:
         """Get unit vectors for multiple pixel centers."""
         return self._pixel_center_vecs[pixel_ids]
 
+    @property
+    def cd_unit_vecs(self) -> np.ndarray:
+        """
+        Get all pixel center unit vectors (npix, 3).
+
+        Stage B: Used for dense HEALPix grid representation where
+        token index corresponds to global HEALPix pixel id.
+
+        Returns:
+            (npix, 3) array of pixel center unit vectors
+        """
+        if self._pixel_center_vecs is None:
+            raise RuntimeError("Pixel centers not computed")
+        return self._pixel_center_vecs
+
     @staticmethod
     def build_time_bins(times: np.ndarray, charges: np.ndarray,
                         t_max: float, num_bins: int) -> np.ndarray:

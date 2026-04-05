@@ -384,8 +384,8 @@ class HTTransformer(nn.Module):
         )
 
         # CD compression: fixed dense grid -> fixed low-res grid
-        cd_emb, cd_pixel_ids_fused, cd_mask = self.cd_compression(
-            cd_emb, pixel_ids=cd_pixel_ids, mask=cd_mask_input, return_mask=True)
+        # Stage B: simplified interface, no pixel_ids needed
+        cd_emb, cd_mask = self.cd_compression(cd_emb, mask=cd_mask_input)
 
         # Encoder layers (all use SDPA-compatible attention)
         for layer in self.encoder_layers:

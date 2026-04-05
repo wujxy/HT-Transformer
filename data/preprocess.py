@@ -44,6 +44,18 @@ def preprocess(config: dict):
 
     manifest_path = os.path.join(preprocessed_dir, 'manifest.json')
     if os.path.exists(manifest_path):
+        # Stage B: Check if existing cache is dense_healpix format
+        with open(manifest_path, 'r') as f:
+            existing_manifest = json.load(f)
+
+        existing_repr = existing_manifest.get('cd_representation', 'active_patch')
+        if existing_repr != 'dense_healpix':
+            raise RuntimeError(
+                f"Existing preprocessed cache is old '{existing_repr}' format. "
+                f"Stage B requires 'dense_healpix' format. "
+                f"Please delete {preprocessed_dir} and re-run preprocessing."
+            )
+
         logger.info(f"Preprocessed data already exists at {preprocessed_dir}")
         logger.info("Delete the directory to re-run preprocessing.")
         return
@@ -125,6 +137,9 @@ def preprocess(config: dict):
     expand_times = config.get('augmentation', {}).get('rotation_expand_times', 0)
     rotation_matrices = []
 
+    # Stage B: Dense HEALPix grid representation
+    npix = 12 * data_cfg['nside'] * data_cfg['nside']
+
     manifest = {
         'original_events': total_events,
         'expand_times': expand_times,
@@ -133,6 +148,11 @@ def preprocess(config: dict):
         'num_files': batch_idx,
         'events_per_file': events_per_batch,
         'config_hash': _config_hash(config),
+        # Stage B: Mark as dense HEALPix format
+        'cd_representation': 'dense_healpix',
+        'nside': data_cfg['nside'],
+        'npix': npix,
+        'num_time_bins': data_cfg['num_time_bins'],
     }
 
     # --- Rotation augmentation expansion ---
@@ -265,6 +285,15 @@ def create_preprocessed_dataloaders(
     manifest_path = os.path.join(preprocessed_dir, 'manifest.json')
     with open(manifest_path, 'r') as f:
         manifest = json.load(f)
+
+    # Stage B: Check cd_representation format
+    cd_repr = manifest.get('cd_representation', 'active_patch')
+    if cd_repr != 'dense_healpix':
+        raise RuntimeError(
+            f"Preprocessed cache is '{cd_repr}' format, "
+            f"but Stage B model requires 'dense_healpix'. "
+            f"Please delete {preprocessed_dir} and re-run preprocessing."
+        )
 
     original_count = manifest.get('original_events', manifest['total_events'])
     expand_times = manifest.get('expand_times', 0)

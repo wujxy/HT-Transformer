@@ -48,6 +48,17 @@ def build_local_neighbor_graph(
     padding_value: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    DEPRECATED in Stage B: This function is no longer needed.
+
+    Stage B uses fixed HEALPix grid representation where:
+    - token index == global HEALPix pixel id
+    - all events share the same graph topology
+    - no per-batch local graph construction is required
+
+    Kept for legacy compatibility only. Use fixed knn_adj directly instead.
+    """
+    # Implementation left for reference, but not used in Stage B main path
+    """
     Build local neighbor graph once per batch.
 
     Vectorized implementation using scatter/gather for GPU acceleration.
@@ -502,6 +513,64 @@ class CDCompression(nn.Module):
 
         return out, pixel_ids_out, cd_mask_out
 
+    def _healpix_pool_dense_stageb(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stage B: Dense fixed-grid pooling without pixel_ids.
+
+        Args:
+            x: (B, npix_in, D) patch embeddings on fixed high-res HEALPix grid
+            mask: (B, npix_in) bool mask, True = inactive/no hits
+
+        Returns:
+            pooled: (B, npix_out, D) pooled embeddings on fixed low-res grid
+            out_mask: (B, npix_out) bool mask, True = inactive
+        """
+        B, N, D = x.shape
+        npix_out = int(self.npix_out.item())
+
+        if self.high_to_low is None:
+            # Fallback: mean pooling to target_tokens
+            out = x.mean(dim=1, keepdim=True).expand(B, self.target_tokens, D)
+            out_mask = torch.zeros(B, self.target_tokens, dtype=torch.bool, device=x.device)
+            return out, out_mask
+
+        # Stage B: fixed grid, high_to_low maps from high-res pixel index to low-res
+        # high_to_low is (npix_in,), we use it directly
+        high_to_low = self.high_to_low.view(1, N).expand(B, -1)  # (B, N)
+        batch_offsets = (torch.arange(B, device=x.device) * npix_out).view(B, 1)
+        bins = high_to_low + batch_offsets
+
+        # Valid tokens mask
+        if mask is None:
+            valid = torch.ones(B, N, dtype=torch.bool, device=x.device)
+        else:
+            valid = ~mask
+
+        bins_valid = bins[valid]
+        x_valid = x[valid]
+
+        # Flattened output buffers
+        out = torch.zeros(B * npix_out, D, device=x.device, dtype=x.dtype)
+        counts = torch.zeros(B * npix_out, device=x.device, dtype=x.dtype)
+
+        # Scatter add
+        out.index_add_(0, bins_valid, x_valid)
+        counts.index_add_(0, bins_valid, torch.ones_like(bins_valid, dtype=x.dtype))
+
+        # Average
+        nonzero = counts > 0
+        out = out / counts.clamp(min=1.0).unsqueeze(-1)
+
+        # Reshape
+        out = out.view(B, npix_out, D)
+        out_mask = ~nonzero.view(B, npix_out)
+
+        return out, out_mask
+
     def _attention_pool(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Learnable attention-based pooling."""
         B = x.shape[0]
@@ -525,43 +594,33 @@ class CDCompression(nn.Module):
         x_reshaped = x_trimmed.view(B, target_n, group_size, D)
         return self.pool_proj(x_reshaped.mean(dim=2))
 
-    def forward(self, x: torch.Tensor, pixel_ids: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None,
-                return_mask: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Stage B: Fixed dense grid pooling.
+
         Args:
-            x: (B, N_cd, D) CD patch embeddings
-            pixel_ids: (B, N_cd) pixel IDs for HEALPix pooling
-            mask: (B, N_cd) bool mask, True = padding
-            return_mask: If True, also return the output mask
+            x: (B, npix_in, D) CD patch embeddings on fixed HEALPix grid
+            mask: (B, npix_in) bool mask, True = inactive/no hits
 
         Returns:
-            pooled: (B, N_out, D) compressed embeddings
-            pixel_ids_out: (B, N_out) or None
-            mask_out: (B, N_out) or None, bool mask where True = padding
+            pooled: (B, npix_out, D) compressed embeddings on fixed low-res grid
+            out_mask: (B, npix_out) bool mask, True = inactive
         """
         if self.method == 'healpix_pool':
-            if pixel_ids is None:
-                raise ValueError("healpix_pool method requires pixel_ids")
-            # Use dense pooling for fixed-shape output (SDPA-compatible)
-            pooled, pixel_ids_out, mask_out = self._healpix_pool_dense(x, pixel_ids, mask=mask)
-            if return_mask:
-                return pooled, pixel_ids_out, mask_out
-            return pooled, pixel_ids_out, None
+            # Stage B: Dense fixed-grid pooling (no pixel_ids needed)
+            pooled, out_mask = self._healpix_pool_dense_stageb(x, mask=mask)
+            return pooled, out_mask
         elif self.method == 'attention_pool':
             pooled = self._attention_pool(x, mask)
-            # For attention_pool, we don't have explicit pixel IDs
-            if return_mask:
-                # mask indicates valid positions in the target space
-                return pooled, None, torch.zeros(pooled.shape[0], pooled.shape[1],
-                                                  dtype=torch.bool, device=pooled.device)
-            return pooled, None, None
+            # All positions valid for attention_pool
+            out_mask = torch.zeros(pooled.shape[0], pooled.shape[1],
+                                   dtype=torch.bool, device=pooled.device)
+            return pooled, out_mask
         elif self.method == 'mean_pool':
             pooled = self._mean_pool(x, self.target_tokens)
-            if return_mask:
-                return pooled, None, torch.zeros(pooled.shape[0], pooled.shape[1],
-                                                  dtype=torch.bool, device=pooled.device)
-            return pooled, None, None
+            out_mask = torch.zeros(pooled.shape[0], pooled.shape[1],
+                                   dtype=torch.bool, device=pooled.device)
+            return pooled, out_mask
         else:
             raise ValueError(f"Unknown compression method: {self.method}")
 

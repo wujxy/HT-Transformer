@@ -24,6 +24,81 @@ from data.normalization import Normalizer
 from geometry.healpix_mapper import HEALPixMapper
 
 
+def build_dense_cd_patches(
+    pixel_ids: np.ndarray,
+    cd_unit_vecs_hits: np.ndarray,
+    cd_times: np.ndarray,
+    cd_charges: np.ndarray,
+    pixel_center_vecs: np.ndarray,
+    npix: int,
+    num_time_bins: int,
+    t_max: float,
+):
+    """
+    Build dense HEALPix patch representation for Stage B.
+
+    Stage B optimization: Returns fixed-shape dense HEALPix grid instead of
+    variable-length active patch list. This enables:
+    - Fixed graph topology for DeepSphere
+    - No runtime local graph construction
+    - Better SDPA/compile compatibility
+
+    Args:
+        pixel_ids: (N_hits,) HEALPix pixel id per CD hit
+        cd_unit_vecs_hits: (N_hits, 3) CD hit directions
+        cd_times: (N_hits,) normalized times [0, 1]
+        cd_charges: (N_hits,) normalized charges
+        pixel_center_vecs: (npix, 3) fixed HEALPix pixel center unit vectors
+        npix: total number of pixels for nside (12 * nside^2)
+        num_time_bins: number of time bins
+        t_max: max time for binning (used for time bin calculation)
+
+    Returns:
+        cd_unit_vecs_dense: (npix, 3) pixel center unit vectors
+        cd_stats_dense: (npix, 4) [sumQ, count, t_min, t_mean]
+        cd_time_bins_dense: (npix, num_time_bins) time histograms
+        cd_mask_dense: (npix,) True = inactive (no hits)
+        cd_times_mean: (npix,) charge-weighted mean time per pixel
+    """
+    # Initialize with fixed shape
+    cd_unit_vecs_dense = pixel_center_vecs.astype(np.float32).copy()
+    cd_stats_dense = np.zeros((npix, 4), dtype=np.float32)
+    cd_time_bins_dense = np.zeros((npix, num_time_bins), dtype=np.float32)
+    cd_mask_dense = np.ones((npix,), dtype=bool)  # True = inactive
+
+    if len(pixel_ids) == 0:
+        cd_times_mean = np.zeros((npix,), dtype=np.float32)
+        return cd_unit_vecs_dense, cd_stats_dense, cd_time_bins_dense, cd_mask_dense, cd_times_mean
+
+    # Group hits by pixel and aggregate
+    unique_pixels = np.unique(pixel_ids)
+    for pix in unique_pixels:
+        mask = (pixel_ids == pix)
+        hit_q = cd_charges[mask]
+        hit_t = cd_times[mask]
+
+        # Aggregate stats
+        cd_stats_dense[pix, 0] = hit_q.sum()  # sumQ
+        cd_stats_dense[pix, 1] = len(hit_q)   # count
+        cd_stats_dense[pix, 2] = hit_t.min() if len(hit_t) > 0 else 0.0  # t_min
+        cd_stats_dense[pix, 3] = (hit_q * hit_t).sum() / (hit_q.sum() + 1e-10)  # t_mean
+
+        # Time bins (times already normalized to [0, 1])
+        bin_idx = np.clip(
+            (hit_t * num_time_bins).astype(np.int32),
+            0, num_time_bins - 1
+        )
+        np.add.at(cd_time_bins_dense[pix], bin_idx, hit_q)
+
+        # Mark as active
+        cd_mask_dense[pix] = False
+
+    # Extract t_mean as separate array for convenience
+    cd_times_mean = cd_stats_dense[:, 3].copy()
+
+    return cd_unit_vecs_dense, cd_stats_dense, cd_time_bins_dense, cd_mask_dense, cd_times_mean
+
+
 def discover_h5_files(path: Union[str, List[str]]) -> List[str]:
     """
     Expand a path specification to a sorted list of H5 files.
@@ -277,8 +352,10 @@ class H5EndpointDataset(Dataset):
         else:
             wp_tokens = np.zeros((0, 5), dtype=np.float32)
 
-        # --- CD patch tokens (vectorized aggregation) ---
+        # --- CD patch tokens: Stage B dense HEALPix grid representation ---
         N_cd = len(cd_unit)
+        npix = self.healpix.npix  # Fixed: 12 * nside^2
+
         if N_cd > 0:
             # When rotation is applied, PMT positions changed → HEALPix pixel assignment changes → re-map
             if self._apply_rotation_aug:
@@ -287,69 +364,48 @@ class H5EndpointDataset(Dataset):
                 pixel_ids = hp.ang2pix(self.healpix.nside, theta_cd, phi_cd, nest=False)
             else:
                 pixel_ids = self.healpix.lookup(cd_copyno)  # (N_cd,)
-            unique_pixels, inverse = np.unique(pixel_ids, return_inverse=True)
-            n_patches = len(unique_pixels)
 
-            # --- Vectorized stats via np.bincount / np.add.at ---
-            # sumQ
-            sumQ = np.bincount(inverse, weights=norm_cd_q,
-                               minlength=n_patches).astype(np.float32)
-            # count
-            count = np.bincount(inverse, minlength=n_patches).astype(np.float32)
-            # t_min: scatter with np.minimum.at
-            t_min_arr = np.full(n_patches, np.inf, dtype=np.float32)
-            np.minimum.at(t_min_arr, inverse, norm_cd_t)
-            t_min_arr = np.where(count > 0, t_min_arr, np.float32(0.0))
-            # t_mean (charge-weighted): sum(q*t) / sum(q)
-            qw_sum = np.bincount(inverse, weights=(norm_cd_q * norm_cd_t).astype(np.float32),
-                                 minlength=n_patches).astype(np.float32)
-            t_mean_arr = qw_sum / (sumQ + 1e-10)
-
-            cd_stats = np.stack([sumQ, count, t_min_arr, t_mean_arr], axis=-1)  # (n_patches, 4)
-
-            # --- Vectorized time-bin histogram ---
-            # times already normalized to [0,1], so t_max=1.0
-            bin_idx = np.clip(
-                (norm_cd_t * self.num_time_bins).astype(np.int32),
-                0, self.num_time_bins - 1
+            # Build dense HEALPix grid (fixed shape: npix)
+            cd_patch_unit, cd_stats, cd_time_bins, cd_mask_dense, cd_patch_t_mean = build_dense_cd_patches(
+                pixel_ids=pixel_ids,
+                cd_unit_vecs_hits=cd_unit.astype(np.float32),
+                cd_times=norm_cd_t,
+                cd_charges=norm_cd_q,
+                pixel_center_vecs=self.healpix.cd_unit_vecs,  # (npix, 3)
+                npix=npix,
+                num_time_bins=self.num_time_bins,
+                t_max=self.t_max,
             )
-            flat_idx = (inverse * self.num_time_bins + bin_idx).astype(np.int64)
-            cd_time_bins = np.bincount(
-                flat_idx, weights=norm_cd_q.astype(np.float64),
-                minlength=n_patches * self.num_time_bins
-            ).astype(np.float32).reshape(n_patches, self.num_time_bins)
-
-            # --- Patch center unit vectors (scatter add + normalize) ---
-            cd_patch_unit = np.zeros((n_patches, 3), dtype=np.float64)
-            np.add.at(cd_patch_unit, inverse, cd_unit.astype(np.float64))
-            norms = np.linalg.norm(cd_patch_unit, axis=1, keepdims=True)
-            cd_patch_unit = np.where(norms > 1e-10,
-                                      (cd_patch_unit / norms).astype(np.float32),
-                                      cd_patch_unit.astype(np.float32))
-
-            cd_patch_t_mean = t_mean_arr
         else:
-            n_patches = 0
-            cd_stats = np.zeros((0, 4), dtype=np.float32)
-            cd_time_bins = np.zeros((0, self.num_time_bins), dtype=np.float32)
-            cd_patch_unit = np.zeros((0, 3), dtype=np.float32)
-            cd_patch_t_mean = np.zeros(0, dtype=np.float32)
+            # No CD hits: return empty dense grid (all masked)
+            cd_patch_unit = self.healpix.cd_unit_vecs.astype(np.float32).copy()
+            cd_stats = np.zeros((npix, 4), dtype=np.float32)
+            cd_time_bins = np.zeros((npix, self.num_time_bins), dtype=np.float32)
+            cd_mask_dense = np.ones((npix,), dtype=bool)
+
+        # Fixed shape for Stage B: (npix, ...)
+        n_patches = npix
+        cd_patch_t_mean = cd_stats[:, 3]  # t_mean is 4th column
 
         # Convert to tensors
-        # Add cd_pixel_ids for DeepSphere encoder
-        cd_pixel_ids = torch.from_numpy(unique_pixels.astype(np.int64)) if N_cd > 0 else torch.zeros(0, dtype=torch.int64)
+        # Note: cd_pixel_ids is deprecated in Stage B (fixed grid, index = pixel id)
+        cd_pixel_ids = torch.arange(npix, dtype=torch.int64)  # 0, 1, ..., npix-1
 
+        # Stage B: CD uses fixed dense HEALPix grid representation
+        # Shape is now fixed (npix, ...) instead of variable (N_active_patches, ...)
         result = {
             'wp_tokens': torch.from_numpy(wp_tokens),           # (N_wp, 5)
             'wp_mask': torch.zeros(N_wp, dtype=torch.bool),     # False = valid
             'wp_unit_vecs': torch.from_numpy(wp_unit.astype(np.float32)),  # (N_wp, 3)
             'wp_times': torch.from_numpy(norm_wp_t.astype(np.float32)),    # (N_wp,)
-            'cd_unit_vecs': torch.from_numpy(cd_patch_unit),    # (N_cd_patch, 3)
-            'cd_stats': torch.from_numpy(cd_stats),             # (N_cd_patch, 4)
-            'cd_time_bins': torch.from_numpy(cd_time_bins),     # (N_cd_patch, B_bins)
-            'cd_mask': torch.zeros(n_patches, dtype=torch.bool), # False = valid
-            'cd_times_mean': torch.from_numpy(cd_patch_t_mean),  # (N_cd_patch,)
-            'cd_pixel_ids': cd_pixel_ids,                        # (N_cd_patch,) HEALPix pixel IDs
+            # Stage B: CD uses fixed dense HEALPix grid (npix = 12 * nside^2)
+            'cd_unit_vecs': torch.from_numpy(cd_patch_unit),    # (npix, 3)
+            'cd_stats': torch.from_numpy(cd_stats),             # (npix, 4)
+            'cd_time_bins': torch.from_numpy(cd_time_bins),     # (npix, B_bins)
+            'cd_mask': torch.from_numpy(cd_mask_dense),         # (npix,) True = inactive/no hits
+            'cd_times_mean': torch.from_numpy(cd_patch_t_mean),  # (npix,)
+            # DEPRECATED in Stage B: kept for compatibility, use index as pixel id
+            'cd_pixel_ids': cd_pixel_ids,                        # (npix,) = [0, 1, ..., npix-1]
             'u1': torch.from_numpy(u1),                          # (3,)
             'u2': torch.from_numpy(u2),                          # (3,)
             'p1': torch.from_numpy(enter),                       # (3,) raw xyz
@@ -376,24 +432,28 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     Custom collate: pad variable-length WP and CD tokens to batch max.
     """
-    # Find max lengths
+    # Stage B: CD uses fixed dense HEALPix grid, so no padding needed for CD
+    # Only WP needs padding due to variable hit counts
     max_wp = max(b['wp_tokens'].shape[0] for b in batch)
-    max_cd = max(b['cd_unit_vecs'].shape[0] for b in batch)
     B = len(batch)
+    npix = batch[0]['cd_unit_vecs'].shape[0]  # Fixed: 12 * nside^2
     num_time_bins = batch[0]['cd_time_bins'].shape[1] if batch[0]['cd_time_bins'].dim() > 1 else 0
 
-    # Allocate padded tensors
+    # Allocate tensors
+    # WP: variable length, needs padding
     wp_tokens = torch.zeros(B, max_wp, 5)
     wp_mask = torch.ones(B, max_wp, dtype=torch.bool)  # True = padding
     wp_unit_vecs = torch.zeros(B, max_wp, 3)
     wp_times = torch.zeros(B, max_wp)
 
-    cd_unit_vecs = torch.zeros(B, max_cd, 3)
-    cd_stats = torch.zeros(B, max_cd, 4)
-    cd_time_bins = torch.zeros(B, max_cd, num_time_bins)
-    cd_mask = torch.ones(B, max_cd, dtype=torch.bool)   # True = padding
-    cd_times_mean = torch.zeros(B, max_cd)
-    cd_pixel_ids = torch.zeros(B, max_cd, dtype=torch.long)  # HEALPix pixel IDs
+    # Stage B: CD fixed shape (npix, ...), no padding needed, just stack
+    cd_unit_vecs = torch.zeros(B, npix, 3)
+    cd_stats = torch.zeros(B, npix, 4)
+    cd_time_bins = torch.zeros(B, npix, num_time_bins)
+    cd_mask = torch.ones(B, npix, dtype=torch.bool)   # True = inactive/no hits
+    cd_times_mean = torch.zeros(B, npix)
+    # DEPRECATED in Stage B: kept for compatibility
+    cd_pixel_ids = torch.arange(npix, dtype=torch.long).unsqueeze(0).expand(B, -1)
 
     u1 = torch.zeros(B, 3)
     u2 = torch.zeros(B, 3)
@@ -402,7 +462,6 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
     for i, b in enumerate(batch):
         n_wp = b['wp_tokens'].shape[0]
-        n_cd = b['cd_unit_vecs'].shape[0]
 
         if n_wp > 0:
             wp_tokens[i, :n_wp] = b['wp_tokens']
@@ -410,13 +469,13 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             wp_unit_vecs[i, :n_wp] = b['wp_unit_vecs']
             wp_times[i, :n_wp] = b['wp_times']
 
-        if n_cd > 0:
-            cd_unit_vecs[i, :n_cd] = b['cd_unit_vecs']
-            cd_stats[i, :n_cd] = b['cd_stats']
-            cd_time_bins[i, :n_cd] = b['cd_time_bins']
-            cd_mask[i, :n_cd] = False
-            cd_times_mean[i, :n_cd] = b['cd_times_mean']
-            cd_pixel_ids[i, :n_cd] = b['cd_pixel_ids']
+        # Stage B: CD fixed shape, direct copy
+        cd_unit_vecs[i] = b['cd_unit_vecs']
+        cd_stats[i] = b['cd_stats']
+        cd_time_bins[i] = b['cd_time_bins']
+        cd_mask[i] = b['cd_mask']  # Use the event's cd_mask (True = inactive)
+        cd_times_mean[i] = b['cd_times_mean']
+        # cd_pixel_ids[i] = b['cd_pixel_ids']  # Now fixed [0, 1, ..., npix-1]
 
         u1[i] = b['u1']
         u2[i] = b['u2']
