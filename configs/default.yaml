@@ -67,7 +67,7 @@ loss:
 
 train:
   optimizer: "adamw"
-  lr: 5.0e-5
+  lr: 1.0e-4
   weight_decay: 1.0e-2
   scheduler: "warmup_plateau"
   warmup_epochs: 5
@@ -75,16 +75,16 @@ train:
   plateau_patience: 5
   plateau_threshold: 1.0e-3
   plateau_min_lr: 1.0e-6
-  early_stop_patience: 8
+  early_stop_patience: 4
   early_stop_monitor: "val_dir_ang_p68"
   early_stop_mode: "min"
   precision: "bf16"
   dropout: 0.1
   grad_clip: 1.0
-  batch_size: 2
+  batch_size: 64
   num_epochs: 200
   save_every: 50
-  eval_every: 10
+  eval_every: 5
   use_accelerate: true
   gradient_accumulation_steps: 2
   seed: 42
