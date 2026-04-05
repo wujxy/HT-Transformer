@@ -120,6 +120,7 @@ class HybridFusionLayer(nn.Module):
 
     Note: CD self-attention is handled by DeepSphereEncoder before this layer.
     Note: WP time bias has been replaced by token-level time encoding for SDPA compatibility.
+    Note: Attention masks are precomputed outside the layer loop for efficiency.
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
@@ -155,49 +156,46 @@ class HybridFusionLayer(nn.Module):
 
     def forward(self, wp_emb: torch.Tensor, cd_emb: torch.Tensor,
                 global_emb: torch.Tensor, query_emb: torch.Tensor,
-                wp_mask: torch.Tensor, cd_mask: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        B = wp_emb.shape[0]
-        N_wp = wp_emb.shape[1]
-        N_cd = cd_emb.shape[1]
-        M = global_emb.shape[1]
-        Q = query_emb.shape[1]
-
+                mask_pack: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, ...]:
+        """
+        Args:
+            wp_emb: (B, N_wp, D)
+            cd_emb: (B, N_cd, D)
+            global_emb: (B, M, D)
+            query_emb: (B, Q, D)
+            mask_pack: dict containing precomputed attention masks
+                - 'wp_attn': (B, N_wp, N_wp) for WP self-attention
+                - 'wp_cross': (B, N_wp, N_cd) for WP->CD cross-attention
+                - 'cd_cross': (B, N_cd, N_wp) for CD->WP cross-attention
+                - 'global': (B, M, N_wp+N_cd) for Global attention
+                - 'query': (B, Q, N_wp+N_cd+M) for Query attention
+        """
         # 1. WP self-attention (SDPA-compatible, no explicit time bias)
         wp_normed = self.wp_attn_norm(wp_emb)
-        wp_attn_mask = wp_mask.unsqueeze(1) | wp_mask.unsqueeze(2)
         wp_out = wp_emb + self.wp_self_attn(wp_normed, wp_normed, wp_normed,
-                                            mask=wp_attn_mask)
+                                            mask=mask_pack['wp_attn'])
 
         # 2. WP↔CD cross-attention (bidirectional)
         wp_cross_in = self.wp_cross_norm(wp_out)
         cd_cross_in = self.cd_cross_norm(cd_emb)
 
-        wp_cross_mask = cd_mask.unsqueeze(1).expand(-1, N_wp, -1)
         wp_out = wp_out + self.wp_cd_cross(wp_cross_in, cd_cross_in, cd_cross_in,
-                                            mask=wp_cross_mask)
+                                            mask=mask_pack['wp_cross'])
 
-        cd_cross_mask = wp_mask.unsqueeze(1).expand(-1, N_cd, -1)
         cd_out = cd_emb + self.cd_wp_cross(cd_cross_in, wp_cross_in, wp_cross_in,
-                                            mask=cd_cross_mask)
+                                            mask=mask_pack['cd_cross'])
 
         # 3. Global↔All
         all_tokens = torch.cat([wp_out, cd_out], dim=1)
-        all_mask = torch.cat([wp_mask, cd_mask], dim=1)
-
         global_normed = self.global_norm(global_emb)
-        global_attn_mask = all_mask.unsqueeze(1).expand(-1, M, -1)
         global_out = global_emb + self.global_attn(global_normed, all_tokens, all_tokens,
-                                                    mask=global_attn_mask)
+                                                    mask=mask_pack['global'])
 
         # 4. Query↔All
         all_with_global = torch.cat([wp_out, cd_out, global_out], dim=1)
-        all_global_mask = torch.cat([wp_mask, cd_mask,
-                                      torch.zeros(B, M, dtype=torch.bool, device=wp_mask.device)], dim=1)
-
         query_normed = self.query_norm(query_emb)
-        query_attn_mask = all_global_mask.unsqueeze(1).expand(-1, Q, -1)
         query_out = query_emb + self.query_attn(query_normed, all_with_global, all_with_global,
-                                                 mask=query_attn_mask)
+                                                 mask=mask_pack['query'])
 
         # 5. FFN
         wp_out = wp_out + self.wp_ffn(self.wp_ffn_norm(wp_out))
@@ -387,12 +385,46 @@ class HTTransformer(nn.Module):
         # Stage B: simplified interface, no pixel_ids needed
         cd_emb, cd_mask = self.cd_compression(cd_emb, mask=cd_mask_input)
 
+        # Precompute attention masks outside layer loop (optimization)
+        # These masks don't change between layers, so compute once here
+        N_wp = wp_emb.shape[1]
+        N_cd = cd_emb.shape[1]
+        M = self.num_global
+        Q = self.num_queries
+
+        wp_mask = batch['wp_mask']
+
+        # WP self-attention mask
+        wp_attn_mask = wp_mask.unsqueeze(1) | wp_mask.unsqueeze(2)
+
+        # WP->CD cross-attention mask
+        wp_cross_mask = cd_mask.unsqueeze(1).expand(-1, N_wp, -1)
+
+        # CD->WP cross-attention mask
+        cd_cross_mask = wp_mask.unsqueeze(1).expand(-1, N_cd, -1)
+
+        # Global attention mask (attends to WP + CD)
+        all_mask = torch.cat([wp_mask, cd_mask], dim=1)
+        global_attn_mask = all_mask.unsqueeze(1).expand(-1, M, -1)
+
+        # Query attention mask (attends to WP + CD + Global)
+        all_global_mask = torch.cat([wp_mask, cd_mask,
+                                      torch.zeros(B, M, dtype=torch.bool, device=wp_mask.device)], dim=1)
+        query_attn_mask = all_global_mask.unsqueeze(1).expand(-1, Q, -1)
+
+        mask_pack = {
+            'wp_attn': wp_attn_mask,
+            'wp_cross': wp_cross_mask,
+            'cd_cross': cd_cross_mask,
+            'global': global_attn_mask,
+            'query': query_attn_mask,
+        }
+
         # Encoder layers (all use SDPA-compatible attention)
         for layer in self.encoder_layers:
             wp_emb, cd_emb, global_emb, query_emb = layer(
                 wp_emb, cd_emb, global_emb, query_emb,
-                wp_mask=batch['wp_mask'],
-                cd_mask=cd_mask,
+                mask_pack=mask_pack,
             )
 
         # Output heads

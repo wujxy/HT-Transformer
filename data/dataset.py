@@ -453,7 +453,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     cd_mask = torch.ones(B, npix, dtype=torch.bool)   # True = inactive/no hits
     cd_times_mean = torch.zeros(B, npix)
     # DEPRECATED in Stage B: kept for compatibility
-    cd_pixel_ids = torch.arange(npix, dtype=torch.long).unsqueeze(0).expand(B, -1)
+    cd_pixel_ids = torch.arange(npix, dtype=torch.long).unsqueeze(0).repeat(B, 1)
 
     u1 = torch.zeros(B, 3)
     u2 = torch.zeros(B, 3)
