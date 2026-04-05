@@ -154,15 +154,38 @@ def _default_config() -> dict:
             'd_model': 128, 'num_layers': 4, 'num_heads': 4, 'd_ff': 512,
             'num_queries': 2, 'num_global_tokens': 8,
             'cd_knn_k': 16,
-            'abs_posenc': 'fourier', 'rel_posenc': 'bucket',
-            'patch_time_encoder': 'conv1d',
-            'num_rpe_angle_buckets': 64, 'num_rpe_time_buckets': 64,
-            'fourier_freq': 32, 'dropout': 0.1,
+            'abs_posenc': 'fourier', 'fourier_freq': 32, 'dropout': 0.1,
+            # WP projector (dual-branch)
+            'wp_geo_hidden': 32,
+            'wp_qt_hidden': 32,
+            'wp_projector_hidden': 64,
+            # WP time bias
+            'wp_time_bias': 'signed_bucket',
+            'wp_num_time_buckets': 64,
+            'wp_time_bias_heads_shared': False,
+            # CD DeepSphere
+            'cd_deepsphere_layers': 4,
+            'cd_deepsphere_hidden': 256,
+            'cd_compression': 'healpix_pool',
+            'cd_fusion_tokens': 128,
+            'cd_compression_nside': 4,
+            # Global normalization
+            'norm_type': 'rmsnorm',
         },
         'loss': {'lambda_ang': 1.0, 'lambda_len': 0.5, 'lambda_dir': 0.25},
         'train': {
             'optimizer': 'adamw', 'lr': 3e-4, 'weight_decay': 1e-2,
-            'scheduler': 'cosine_with_warmup', 'warmup_steps': 500,
+            # V2 scheduler: Warmup + ReduceLROnPlateau (fixed configuration)
+            'warmup_epochs': 5,       # Linear warmup epochs at start
+            'plateau_factor': 0.5,    # LR reduction factor on plateau
+            'plateau_patience': 5,    # Epochs to wait before reducing LR
+            'plateau_threshold': 1e-3, # Minimum change to qualify as improvement
+            'plateau_min_lr': 1e-6,   # Minimum learning rate
+            # Early stopping (V2)
+            'early_stop_patience': 8,
+            'early_stop_monitor': 'val_dir_ang_p68',  # Metric to monitor
+            'early_stop_mode': 'min',
+            # Training settings
             'precision': 'bf16', 'dropout': 0.1, 'grad_clip': 1.0,
             'batch_size': 2, 'num_epochs': 200,
             'save_every': 50, 'eval_every': 10,

@@ -20,10 +20,10 @@ from typing import Dict, List, Optional, Tuple
 from loguru import logger
 from tqdm import tqdm
 
-from DataLoader import (
+from data.dataset import (
     H5EndpointDataset, collate_fn, discover_h5_files,
 )
-from Augmentation import random_rotation_matrix
+from data.augmentation import random_rotation_matrix
 
 
 def identity_collate_fn(batch):
@@ -49,8 +49,8 @@ def preprocess(config: dict):
         return
 
     # --- Initialize geometry + HEALPix ---
-    from Geometry import DualPMTPositionLookup
-    from HEALPix import HEALPixMapper
+    from geometry.detector_geometry import DualPMTPositionLookup
+    from geometry.healpix_mapper import HEALPixMapper
 
     geometry = DualPMTPositionLookup(
         data_cfg['geometry_cd'], data_cfg['geometry_wp'])
@@ -136,12 +136,13 @@ def preprocess(config: dict):
     }
 
     # --- Rotation augmentation expansion ---
-    # Each expansion applies ONE fixed random SO(3) rotation to ALL events,
-    # re-tokenizing from scratch (HEALPix mapping changes naturally).
+    # Each expansion generates a new copy of the dataset where EVERY event
+    # independently samples a random SO(3) rotation (inside __getitem__).
+    # The expansion just repeats this process to create multiple rotated copies.
     for exp in range(expand_times):
-        R = random_rotation_matrix()
+        R = random_rotation_matrix()  # Only used as expansion identifier
         rotation_matrices.append(R)
-        logger.info(f"Rotation expansion {exp+1}/{expand_times}: applying random SO(3) rotation")
+        logger.info(f"Rotation expansion {exp+1}/{expand_times}: generating rotated copy (per-event random)")
 
         rot_dataset = H5EndpointDataset(
             h5_files, config, geometry, healpix,
@@ -171,6 +172,8 @@ def preprocess(config: dict):
     # Update manifest with final info
     manifest['num_files'] = batch_idx
     manifest['events_per_file'] = events_per_batch
+    # NOTE: rotation_matrices are only expansion identifiers (one per expansion).
+    # Actual rotations are per-event random samples, not recorded here.
     manifest['rotation_matrices'] = [R.tolist() for R in rotation_matrices]
 
     with open(manifest_path, 'w') as f:

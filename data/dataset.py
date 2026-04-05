@@ -19,9 +19,9 @@ import h5py
 import healpy as hp
 from loguru import logger
 
-from Geometry import DualPMTPositionLookup, PMT_COPYNO_OFFSET
-from Normalizer import Normalizer
-from HEALPix import HEALPixMapper
+from geometry.detector_geometry import DualPMTPositionLookup, PMT_COPYNO_OFFSET
+from data.normalization import Normalizer
+from geometry.healpix_mapper import HEALPixMapper
 
 
 def discover_h5_files(path: Union[str, List[str]]) -> List[str]:
@@ -236,7 +236,7 @@ class H5EndpointDataset(Dataset):
 
         # --- Per-event random SO(3) rotation augmentation ---
         if self._apply_rotation_aug:
-            from Augmentation import random_rotation_matrix
+            from data.augmentation import random_rotation_matrix
             R = random_rotation_matrix()
             unit_vecs = (R @ unit_vecs.T).T          # (N, 3)
             positions = (R @ positions.T).T          # (N, 3)
@@ -336,6 +336,9 @@ class H5EndpointDataset(Dataset):
             cd_patch_t_mean = np.zeros(0, dtype=np.float32)
 
         # Convert to tensors
+        # Add cd_pixel_ids for DeepSphere encoder
+        cd_pixel_ids = torch.from_numpy(unique_pixels.astype(np.int64)) if N_cd > 0 else torch.zeros(0, dtype=torch.int64)
+
         result = {
             'wp_tokens': torch.from_numpy(wp_tokens),           # (N_wp, 5)
             'wp_mask': torch.zeros(N_wp, dtype=torch.bool),     # False = valid
@@ -346,6 +349,7 @@ class H5EndpointDataset(Dataset):
             'cd_time_bins': torch.from_numpy(cd_time_bins),     # (N_cd_patch, B_bins)
             'cd_mask': torch.zeros(n_patches, dtype=torch.bool), # False = valid
             'cd_times_mean': torch.from_numpy(cd_patch_t_mean),  # (N_cd_patch,)
+            'cd_pixel_ids': cd_pixel_ids,                        # (N_cd_patch,) HEALPix pixel IDs
             'u1': torch.from_numpy(u1),                          # (3,)
             'u2': torch.from_numpy(u2),                          # (3,)
             'p1': torch.from_numpy(enter),                       # (3,) raw xyz
@@ -371,7 +375,6 @@ class H5EndpointDataset(Dataset):
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     Custom collate: pad variable-length WP and CD tokens to batch max.
-    Add shared cd_knn_adj.
     """
     # Find max lengths
     max_wp = max(b['wp_tokens'].shape[0] for b in batch)
@@ -390,6 +393,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     cd_time_bins = torch.zeros(B, max_cd, num_time_bins)
     cd_mask = torch.ones(B, max_cd, dtype=torch.bool)   # True = padding
     cd_times_mean = torch.zeros(B, max_cd)
+    cd_pixel_ids = torch.zeros(B, max_cd, dtype=torch.long)  # HEALPix pixel IDs
 
     u1 = torch.zeros(B, 3)
     u2 = torch.zeros(B, 3)
@@ -412,6 +416,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             cd_time_bins[i, :n_cd] = b['cd_time_bins']
             cd_mask[i, :n_cd] = False
             cd_times_mean[i, :n_cd] = b['cd_times_mean']
+            cd_pixel_ids[i, :n_cd] = b['cd_pixel_ids']
 
         u1[i] = b['u1']
         u2[i] = b['u2']
@@ -428,6 +433,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         'cd_time_bins': cd_time_bins,
         'cd_mask': cd_mask,
         'cd_times_mean': cd_times_mean,
+        'cd_pixel_ids': cd_pixel_ids,
         'u1': u1,
         'u2': u2,
         'p1': p1,
@@ -460,7 +466,7 @@ def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,
 
     if os.path.exists(manifest_path):
         logger.info(f"Found preprocessed data at {preprocessed_dir}, using directly")
-        from Preprocess import create_preprocessed_dataloaders
+        from data.preprocess import create_preprocessed_dataloaders
         return create_preprocessed_dataloaders(config, preprocessed_dir)
 
     logger.info("No preprocessed data found, using raw H5 files")

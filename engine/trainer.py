@@ -11,15 +11,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from loguru import logger
 from tqdm import tqdm
 
-from Model import HTTransformer
-from LossFunction import EndpointLoss
-from DataLoader import create_dataloaders
-from Geometry import DualPMTPositionLookup
-from HEALPix import HEALPixMapper
+from models.ht_transformer import HTTransformer
+from models.losses.endpoint_loss import EndpointLoss
+from data.dataset import create_dataloaders
+from geometry.detector_geometry import DualPMTPositionLookup
+from geometry.healpix_mapper import HEALPixMapper
 
 try:
     from accelerate import Accelerator
@@ -29,14 +29,144 @@ except ImportError:
     HAS_ACCELERATE = False
 
 
-def get_cosine_with_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
-    """Cosine annealing with linear warmup."""
+def get_warmup_scheduler(optimizer, warmup_steps: int):
+    """Simple linear warmup scheduler (for use before plateau)."""
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
-        progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+        return 1.0
     return LambdaLR(optimizer, lr_lambda)
+
+
+class WarmupPlateauScheduler:
+    """
+    Combined warmup + ReduceLROnPlateau scheduler.
+
+    Phase 1: Linear warmup for warmup_epochs
+    Phase 2: ReduceLROnPlateau based on validation loss
+    """
+
+    def __init__(self, optimizer, warmup_epochs: int, plateau_factor: float = 0.5,
+                 plateau_patience: int = 5, plateau_threshold: float = 1e-3,
+                 plateau_min_lr: float = 1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = 0
+        self.in_warmup = True
+
+        # Warmup scheduler
+        self.warmup_scheduler = get_warmup_scheduler(
+            optimizer, warmup_epochs * 100)  # Approximate steps
+
+        # Plateau scheduler (created after warmup)
+        self.plateau_scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=plateau_factor,
+            patience=plateau_patience,
+            threshold=plateau_threshold,
+            cooldown=1,
+            min_lr=plateau_min_lr,
+        )
+
+    def step(self, metrics=None, epoch=None):
+        """Step the scheduler."""
+        if epoch is not None:
+            self.current_epoch = epoch
+
+        if self.current_epoch < self.warmup_epochs:
+            self.in_warmup = True
+            self.warmup_scheduler.step()
+        else:
+            self.in_warmup = False
+            if metrics is not None:
+                self.plateau_scheduler.step(metrics)
+
+    def step_batch(self):
+        """Step warmup scheduler per batch (during warmup phase only)."""
+        if self.in_warmup:
+            self.warmup_scheduler.step()
+
+    def get_last_lr(self):
+        """Get current learning rate."""
+        return self.optimizer.param_groups[0]['lr']
+
+    def state_dict(self):
+        return {
+            'warmup_scheduler': self.warmup_scheduler.state_dict(),
+            'plateau_scheduler': self.plateau_scheduler.state_dict(),
+            'current_epoch': self.current_epoch,
+            'in_warmup': self.in_warmup,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.warmup_scheduler.load_state_dict(state_dict['warmup_scheduler'])
+        self.plateau_scheduler.load_state_dict(state_dict['plateau_scheduler'])
+        self.current_epoch = state_dict['current_epoch']
+        self.in_warmup = state_dict['in_warmup']
+
+
+class EarlyStopping:
+    """
+    Early stopping based on validation metrics.
+
+    Monitors a metric and stops training if no improvement for patience epochs.
+    """
+
+    def __init__(self, patience: int = 8, mode: str = 'min', min_delta: float = 1e-4):
+        """
+        Args:
+            patience: Number of epochs with no improvement before stopping
+            mode: 'min' or 'max' - whether lower or higher is better
+            min_delta: Minimum change to qualify as improvement
+        """
+        self.patience = patience
+        self.mode = mode
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+
+        if mode == 'min':
+            self.is_better = lambda score, best: score < best - min_delta
+            self.best_score = float('inf')
+        else:
+            self.is_better = lambda score, best: score > best + min_delta
+            self.best_score = float('-inf')
+
+    def __call__(self, score: float, epoch: int) -> bool:
+        """
+        Check if should stop.
+
+        Returns:
+            True if should stop, False otherwise
+        """
+        if self.is_better(score, self.best_score):
+            self.best_score = score
+            self.counter = 0
+            self.best_epoch = epoch
+            return False
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+            return False
+
+    def state_dict(self):
+        return {
+            'counter': self.counter,
+            'best_score': self.best_score,
+            'early_stop': self.early_stop,
+            'best_epoch': self.best_epoch,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.counter = state_dict['counter']
+        self.best_score = state_dict['best_score']
+        self.early_stop = state_dict['early_stop']
+        self.best_epoch = state_dict['best_epoch']
 
 
 class Trainer:
@@ -125,9 +255,6 @@ class Trainer:
             cd_unit_vecs=cd_unit_vecs,
         )
 
-        # Build kNN adjacency
-        self.healpix.build_knn_adjacency(k=self.model_cfg['cd_knn_k'])
-
         # Data
         logger.info("Creating dataloaders...")
         self.train_loader, self.val_loader, self.test_loader = create_dataloaders(
@@ -156,12 +283,31 @@ class Trainer:
             weight_decay=self.train_cfg['weight_decay'],
         )
 
-        # Scheduler
-        total_steps = self.train_cfg['num_epochs'] * len(self.train_loader)
-        warmup = self.train_cfg.get('warmup_steps', 500)
-        self.scheduler = get_cosine_with_warmup_scheduler(
-            self.optimizer, warmup, total_steps)
-        logger.info(f"Total steps: {total_steps}, warmup: {warmup}")
+        # Scheduler: Warmup + ReduceLROnPlateau
+        warmup_epochs = self.train_cfg.get('warmup_epochs', 5)
+        self.scheduler = WarmupPlateauScheduler(
+            self.optimizer,
+            warmup_epochs=warmup_epochs,
+            plateau_factor=self.train_cfg.get('plateau_factor', 0.5),
+            plateau_patience=self.train_cfg.get('plateau_patience', 5),
+            plateau_threshold=self.train_cfg.get('plateau_threshold', 1e-3),
+            plateau_min_lr=self.train_cfg.get('plateau_min_lr', 1e-6),
+        )
+        logger.info(f"Using Warmup+Plateau scheduler: warmup_epochs={warmup_epochs}")
+
+        # Early stopping (V2)
+        if self.train_cfg.get('early_stop_patience', 0) > 0:
+            self.early_stopping = EarlyStopping(
+                patience=self.train_cfg['early_stop_patience'],
+                mode=self.train_cfg.get('early_stop_mode', 'min'),
+                min_delta=1e-4,
+            )
+            self.early_stop_monitor = self.train_cfg.get('early_stop_monitor', 'val_dir_ang_p68')
+            logger.info(f"Early stopping enabled: monitor={self.early_stop_monitor}, "
+                       f"patience={self.train_cfg['early_stop_patience']}")
+        else:
+            self.early_stopping = None
+            self.early_stop_monitor = None
 
         # AMP (mixed precision) — only used when NOT using accelerate
         if not self.use_accelerate:
@@ -182,9 +328,7 @@ class Trainer:
         }
         self.best_val_loss = float('inf')
         self.global_step = 0
-
-        # Add kNN adjacency to config for model access
-        self._cd_knn_adj_tensor = None
+        self.current_epoch = 0
 
         # Accelerate prepare (must be after model/optimizer/dataloader creation)
         if self.use_accelerate:
@@ -203,7 +347,7 @@ class Trainer:
 
         lines = [
             sep,
-            "Model Architecture Summary",
+            "Model Architecture Summary (V2)",
             sep,
             f"  d_model={m.d_model}, num_layers={m.num_layers}, "
             f"num_heads={mc['num_heads']}, d_ff={mc['d_ff']}, "
@@ -211,10 +355,11 @@ class Trainer:
             f"  num_global_tokens={m.num_global}, num_queries={m.num_queries}, "
             f"cd_knn_k={mc['cd_knn_k']}, nside={dc['nside']}",
             "",
-            f"  Per-layer attention modules (x{m.num_layers}):",
-            f"    WP self-attn      : dense, (B, H, N_wp, N_wp)",
-            f"    CD self-attn      : kNN (k={mc['cd_knn_k']}), (B, H, N_cd, N_cd)"
-            + (" + RPE" if mc.get('rel_posenc') == 'bucket' else ""),
+            f"  Architecture (V2 with DeepSphere):",
+            f"    WP projector      : dual-branch [ux,uy,uz]⊕[q,t]",
+            f"    CD encoder        : DeepSphere ({mc.get('cd_deepsphere_layers', 4)} layers)",
+            f"    CD compression    : {mc.get('cd_compression', 'healpix_pool')} -> {mc.get('cd_fusion_tokens', 128)} tokens",
+            f"    WP self-attn      : dense + signed time bias",
             f"    WP->CD cross-attn : dense, (B, H, N_wp, N_cd)",
             f"    CD->WP cross-attn : dense, (B, H, N_cd, N_wp)",
             f"    Global->All attn  : dense, (B, H, {m.num_global}, N_wp+N_cd)",
@@ -228,15 +373,20 @@ class Trainer:
         def count_params(module):
             return sum(p.numel() for p in module.parameters())
 
+        # V2 architecture components
         components = [
-            ("Token Projectors  ", count_params(m.wp_projector) + count_params(m.cd_projector)),
+            ("WP Projector      ", count_params(m.wp_projector)),
+            ("CD Projector      ", count_params(m.cd_projector)),
+            ("CD Encoder (DeepSphere)", count_params(m.cd_encoder) if hasattr(m, 'cd_encoder') else 0),
+            ("CD Compression    ", count_params(m.cd_compression) if hasattr(m, 'cd_compression') else 0),
+            ("WP Time Bias      ", count_params(m.wp_time_bias) if hasattr(m, 'wp_time_bias') and m.wp_time_bias is not None else 0),
             ("Type Embedding    ", count_params(m.type_embedding)),
             ("Position Encoding ", count_params(m.abs_pe)),
-            ("Encoder Layers    ", count_params(m.encoder_layers)),
+            ("Fusion Layers     ", count_params(m.encoder_layers)),
             ("  - Attention     ", sum(
                 count_params(getattr(layer, name))
                 for layer in m.encoder_layers
-                for name in ['wp_self_attn', 'cd_self_attn', 'wp_cd_cross',
+                for name in ['wp_self_attn', 'wp_cd_cross',
                              'cd_wp_cross', 'global_attn', 'query_attn']
             )),
             ("  - FFN           ", sum(
@@ -247,14 +397,10 @@ class Trainer:
             ("  - LayerNorm     ", sum(
                 count_params(getattr(layer, name))
                 for layer in m.encoder_layers
-                for name in ['wp_attn_norm', 'cd_attn_norm', 'wp_cross_norm',
+                for name in ['wp_attn_norm', 'wp_cross_norm',
                              'cd_cross_norm', 'global_norm', 'query_norm',
                              'wp_ffn_norm', 'cd_ffn_norm', 'global_ffn_norm',
                              'query_ffn_norm']
-            )),
-            ("  - RPE           ", sum(
-                count_params(layer.rpe) for layer in m.encoder_layers
-                if hasattr(layer, 'rpe') and layer.rpe is not None
             )),
             ("Output Heads      ", count_params(m.head1) + count_params(m.head2)),
             ("Learnable Tokens  ", count_params(nn.ParameterList([m.global_tokens, m.query_tokens]))),
@@ -273,13 +419,6 @@ class Trainer:
         for line in lines:
             logger.info(line)
 
-    def _get_knn_adj_tensor(self, N_cd: int) -> torch.Tensor:
-        """Get kNN adjacency tensor sized for current batch."""
-        if self._cd_knn_adj_tensor is None:
-            adj = self.healpix.get_knn_adjacency(k=self.model_cfg['cd_knn_k'])
-            self._cd_knn_adj_tensor = torch.from_numpy(adj).long()
-        return self._cd_knn_adj_tensor[:N_cd].to(self.device)
-
     def _verify_gradient_flow(self):
         """Verify that all model parameters receive gradients during backward pass."""
         logger.info("Verifying gradient flow...")
@@ -290,8 +429,6 @@ class Trainer:
         for batch in self.train_loader:
             test_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
-            N_cd = test_batch['cd_unit_vecs'].shape[1]
-            test_batch['cd_knn_adj'] = self._get_knn_adj_tensor(N_cd)
             break
 
         if test_batch is None:
@@ -345,7 +482,11 @@ class Trainer:
             t_val = time.time() - t0 - t_train
 
             # --- Log ---
-            lr = self.optimizer.param_groups[0]['lr']
+            lr = self.scheduler.get_last_lr()
+
+            # Step scheduler (epoch-based)
+            self.scheduler.step(metrics=val_metrics['loss_total'], epoch=epoch)
+
             if self._is_main:
                 self.history['train_loss'].append(train_metrics['loss_total'])
                 self.history['val_loss'].append(val_metrics['loss_total'])
@@ -356,6 +497,11 @@ class Trainer:
                 self.history['val_len'].append(val_metrics['loss_len'])
                 self.history['val_dir'].append(val_metrics['loss_dir'])
                 self.history['lr'].append(lr)
+                self.current_epoch = epoch + 1
+
+                # Log scheduler status
+                phase = "warmup" if self.scheduler.in_warmup else "plateau"
+                scheduler_status = f" [{phase}]"
 
                 logger.info(
                     f"Epoch [{epoch+1}/{num_epochs}] "
@@ -363,7 +509,7 @@ class Trainer:
                     f"(ang={train_metrics['loss_ang']:.4f} len={train_metrics['loss_len']:.4f} "
                     f"dir={train_metrics['loss_dir']:.4f}) "
                     f"Val loss: {val_metrics['loss_total']:.4f} "
-                    f"LR: {lr:.6f} "
+                    f"LR: {lr:.6f}{scheduler_status} "
                     f"Time: {t_train:.1f}s+{t_val:.1f}s"
                 )
 
@@ -384,14 +530,54 @@ class Trainer:
                     self._plot_training_curves()
                 self._eval_and_plot(epoch)
 
+            # --- Early stopping check (V2) ---
+            if self.early_stopping is not None and (epoch + 1) % eval_every == 0:
+                # Get monitored metric from history
+                metric_key = self.early_stop_monitor
+                if metric_key in self.history and len(self.history[metric_key]) > 0:
+                    metric_value = self.history[metric_key][-1]
+                    should_stop = self.early_stopping(metric_value, epoch + 1)
+                    if should_stop and self._is_main:
+                        logger.info(
+                            f"Early stopping triggered at epoch {epoch+1}. "
+                            f"Best {metric_key}={self.early_stopping.best_score:.4f} "
+                            f"at epoch {self.early_stopping.best_epoch}"
+                        )
+                        break
+
+        # Training complete - record final status
+        final_epoch = self.current_epoch  # Actual last epoch (may differ from num_epochs if early stopped)
+
         # Final save
         self._save_checkpoint('final.pth')
         if self._is_main:
             self._plot_training_curves()
-        self._eval_and_plot(num_epochs - 1)
+        self._eval_and_plot(final_epoch - 1)  # Use actual final epoch
         if self._is_main:
+            # Add early stopping info to history
+            if self.early_stopping is not None:
+                self.history['stopped_early'] = self.early_stopping.early_stop
+                self.history['stopped_epoch'] = final_epoch if self.early_stopping.early_stop else None
+                self.history['best_epoch'] = self.early_stopping.best_epoch
+                self.history['best_monitor_value'] = self.early_stopping.best_score
+                self.history['early_stop_monitor'] = self.early_stop_monitor
+            else:
+                self.history['stopped_early'] = False
+                self.history['stopped_epoch'] = None
+                self.history['best_epoch'] = final_epoch
+                self.history['best_monitor_value'] = None
+
             self._save_history()
-            logger.info("Training complete!")
+
+            # Log completion status
+            if self.early_stopping is not None and self.early_stopping.early_stop:
+                logger.info(
+                    f"Training complete! Early stopped at epoch {final_epoch}. "
+                    f"Best {self.early_stop_monitor}={self.early_stopping.best_score:.4f} "
+                    f"at epoch {self.early_stopping.best_epoch}"
+                )
+            else:
+                logger.info(f"Training complete! Finished all {final_epoch} epochs.")
 
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
@@ -409,10 +595,6 @@ class Trainer:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            # Add kNN adj
-            N_cd = batch['cd_unit_vecs'].shape[1]
-            batch['cd_knn_adj'] = self._get_knn_adj_tensor(N_cd)
-
             if self.use_accelerate:
                 with self.accelerator.accumulate(self.model):
                     outputs = self.model(batch)
@@ -425,7 +607,7 @@ class Trainer:
                         grad_clip = self.train_cfg.get('grad_clip', 1.0)
                         self.accelerator.clip_grad_norm_(self.model.parameters(), grad_clip)
                         self.optimizer.step()
-                        self.scheduler.step()
+                        self.scheduler.step_batch()
                         self.optimizer.zero_grad()
             else:
                 with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
@@ -442,7 +624,7 @@ class Trainer:
                 nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.scheduler.step()
+                self.scheduler.step_batch()
 
             total_loss += loss_dict['loss_total']
             total_ang += loss_dict['loss_ang']
@@ -477,9 +659,6 @@ class Trainer:
         for batch in val_pbar:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
-
-            N_cd = batch['cd_unit_vecs'].shape[1]
-            batch['cd_knn_adj'] = self._get_knn_adj_tensor(N_cd)
 
             if self.use_accelerate:
                 outputs = self.model(batch)
@@ -538,9 +717,6 @@ class Trainer:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            N_cd = batch['cd_unit_vecs'].shape[1]
-            batch['cd_knn_adj'] = self._get_knn_adj_tensor(N_cd)
-
             outputs = model(batch)
 
             all_pred_u1.append(outputs['pred_u1'].cpu().numpy())
@@ -557,8 +733,8 @@ class Trainer:
 
     def _eval_and_plot(self, epoch: int):
         """Run reconstruction metrics computation and plot distributions."""
-        from Metrics import compute_training_metrics
-        from Plotting import plot_training_eval_distributions
+        from metrics.endpoint_metrics import compute_training_metrics
+        from visualization.plotting import plot_training_eval_distributions
 
         sphere_radius = self.data_cfg.get('sphere_radius', 25000.0)
 

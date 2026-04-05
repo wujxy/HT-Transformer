@@ -1,5 +1,5 @@
 """
-Token Projectors for WP and CD tokens.
+Token Projectors for WP and CD tokens (V2 Architecture).
 
 Maps raw token features to unified d_model dimension.
 Includes type embedding (WP, CD, GLOBAL, QUERY) and Fourier position encoding.
@@ -19,14 +19,63 @@ TOKEN_QUERY = 3
 
 
 class WPProjector(nn.Module):
-    """Project WP hit token [ux, uy, uz, q, t] -> d_model."""
+    """
+    Enhanced WP token projector with dual-branch feature extraction.
 
-    def __init__(self, input_dim: int = 5, d_model: int = 128):
+    Branch 1 (Geometry): [ux, uy, uz] -> MLP
+    Branch 2 (Optical-Time): [q, t] -> MLP
+    Concat -> Fusion MLP -> d_model
+
+    Input: (B, N_wp, 5) - [ux, uy, uz, q, t]
+    Output: (B, N_wp, d_model)
+    """
+
+    def __init__(self, d_model: int = 128, d_geo: int = 32, d_qt: int = 32,
+                 hidden: int = 64, dropout: float = 0.1):
         super().__init__()
-        self.linear = nn.Linear(input_dim, d_model)
+        self.d_model = d_model
+        self.d_geo = d_geo
+        self.d_qt = d_qt
+
+        # Geometry branch: [ux, uy, uz]
+        self.geo_branch = nn.Sequential(
+            nn.Linear(3, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_geo),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Optical-time branch: [q, t]
+        self.qt_branch = nn.Sequential(
+            nn.Linear(2, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_qt),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(d_geo + d_qt, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        """
+        Args:
+            x: (B, N_wp, 5) - [ux, uy, uz, q, t]
+
+        Returns:
+            (B, N_wp, d_model)
+        """
+        geo_features = self.geo_branch(x[..., :3])   # (B, N, d_geo)
+        qt_features = self.qt_branch(x[..., 3:])     # (B, N, d_qt)
+        combined = torch.cat([geo_features, qt_features], dim=-1)  # (B, N, d_geo+d_qt)
+        return self.fusion(combined)
 
 
 class CDProjector(nn.Module):
@@ -131,3 +180,10 @@ class FourierPositionEncoding(nn.Module):
         proj = u @ self.B  # (..., num_freq)
         features = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # (..., num_freq*2)
         return self.linear(features)
+
+
+__all__ = [
+    'WPProjector', 'CDProjector',
+    'TokenTypeEmbedding', 'FourierPositionEncoding',
+    'TOKEN_WP', 'TOKEN_CD', 'TOKEN_GLOBAL', 'TOKEN_QUERY',
+]

@@ -179,7 +179,7 @@ def evaluate_model(model, dataloader, device, config) -> Dict:
     """
     import torch
     from tqdm import tqdm
-    from LossFunction import EndpointLoss
+    from models.losses.endpoint_loss import EndpointLoss
 
     model.eval()
     criterion = EndpointLoss(
@@ -201,10 +201,6 @@ def evaluate_model(model, dataloader, device, config) -> Dict:
         for batch in tqdm(dataloader, desc="Evaluating"):
             batch_gpu = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                         for k, v in batch.items()}
-
-            # Add kNN adj
-            adj = dataloader.dataset.healpix.get_knn_adjacency(k=config['model']['cd_knn_k'])
-            batch_gpu['cd_knn_adj'] = torch.from_numpy(adj).long().to(device)
 
             outputs = model(batch_gpu)
             loss, _ = criterion(

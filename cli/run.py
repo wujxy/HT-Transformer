@@ -1,26 +1,22 @@
 """
-Unified entry point for HT-Transformer.
+Unified entry point for HT-Transformer-DS.
 
 Modes:
   --InspectH5 : Run h5 schema inspection
   --TrainModel: Train model
   --Predict   : Run prediction
   --Eval      : Run evaluation + visualization
+  --Preprocess: Preprocess H5 data into tokenized .pt files
 
 Usage:
-  python RunModule.py --config configs/default.yaml --TrainModel
-  python RunModule.py --config configs/default.yaml --InspectH5
+  python -m ht_transformer_ds.cli.run --config configs/default.yaml --TrainModel
+  python -m ht_transformer_ds.cli.run --config configs/default.yaml --InspectH5
 """
 
-import sys
 import os
 
-# Add parent directory (for package imports)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from loguru import logger
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python'))
-from Config import load_config
+from config.loader import load_config
 
 
 def main():
@@ -28,24 +24,24 @@ def main():
     mode = config['_mode']
 
     if mode['inspect_h5']:
-        from InspectH5 import inspect_h5
+        from data.inspect_h5 import inspect_h5
         h5_path = config['data']['h5_path']
         inspect_h5(h5_path)
         return
 
     if mode.get('preprocess'):
-        from Preprocess import preprocess
+        from data.preprocess import preprocess
         preprocess(config)
         return
 
     if mode['train']:
-        from ModelTrain import Trainer
+        from engine.trainer import Trainer
         trainer = Trainer(config)
         trainer.run()
         return
 
     if mode['predict']:
-        from ModelPredict import Predictor
+        from engine.predictor import Predictor
         checkpoint = config.get('checkpoint_path', None)
         if checkpoint is None:
             # Find latest checkpoint
@@ -65,13 +61,13 @@ def main():
         return
 
     if mode['eval']:
-        from ModelPredict import Predictor
-        from Metrics import evaluate_model, format_metrics, compute_endpoint_metrics
-        from Plotting import plot_training_curves, plot_result_distributions, plot_event_3d
-        from Geometry import DualPMTPositionLookup
-        from HEALPix import HEALPixMapper
-        from DataLoader import create_dataloaders
-        from Model import HTTransformer
+        from engine.predictor import Predictor
+        from metrics.endpoint_metrics import evaluate_model, format_metrics, compute_endpoint_metrics
+        from visualization.plotting import plot_training_curves, plot_result_distributions, plot_event_3d
+        from geometry.detector_geometry import DualPMTPositionLookup
+        from geometry.healpix_mapper import HEALPixMapper
+        from data.dataset import create_dataloaders
+        from models.ht_transformer import HTTransformer
         import torch
         import numpy as np
         import json

@@ -9,11 +9,11 @@ import numpy as np
 import torch
 from loguru import logger
 
-from Config import load_config
-from Geometry import DualPMTPositionLookup
-from HEALPix import HEALPixMapper
-from DataLoader import create_dataloaders
-from Model import HTTransformer
+from config.loader import load_config
+from geometry.detector_geometry import DualPMTPositionLookup
+from geometry.healpix_mapper import HEALPixMapper
+from data.dataset import create_dataloaders
+from models.ht_transformer import HTTransformer
 
 
 class Predictor:
@@ -69,10 +69,6 @@ class Predictor:
         # Create dataloader (use all data as test)
         _, _, test_loader = create_dataloaders(self.cfg, self.geometry, self.healpix)
 
-        # Get kNN adj
-        adj = self.healpix.get_knn_adjacency(k=self.cfg['model']['cd_knn_k'])
-        adj_tensor = torch.from_numpy(adj).long().to(self.device)
-
         all_pred_u1 = []
         all_pred_u2 = []
         all_gt_u1 = []
@@ -84,7 +80,6 @@ class Predictor:
             for batch in test_loader:
                 batch_gpu = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
-                batch_gpu['cd_knn_adj'] = adj_tensor
 
                 outputs = self.model(batch_gpu)
 
