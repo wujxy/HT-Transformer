@@ -262,6 +262,10 @@ class HTTransformer(nn.Module):
         else:
             self.wp_time_bias = None
 
+        # WP time bias: only apply to first k layers (default: all layers)
+        # This allows later layers to use SDPA fast path
+        self.wp_time_bias_layers = model_cfg.get('wp_time_bias_layers', self.num_layers)
+
         # Token projectors
         self.wp_projector = WPProjector(
             d_model=self.d_model,
@@ -374,27 +378,34 @@ class HTTransformer(nn.Module):
 
         # DeepSphere encoding + Compression
         cd_pixel_ids = batch.get('cd_pixel_ids', None)
-        cd_emb = self.cd_encoder(cd_emb, pixel_ids=cd_pixel_ids,
-                                  full_knn_adj=self.cd_knn_adj)
+        cd_emb = self.cd_encoder(
+            cd_emb,
+            pixel_ids=cd_pixel_ids,
+            full_knn_adj=self.cd_knn_adj,
+            cd_mask=batch.get('cd_mask', None),
+        )
         cd_emb, cd_pixel_ids_fused = self.cd_compression(
             cd_emb, pixel_ids=cd_pixel_ids, mask=batch['cd_mask'])
         cd_mask = (cd_emb.abs().sum(dim=-1) == 0) if cd_pixel_ids_fused is None else \
                   (cd_pixel_ids_fused == -1)
 
-        # Compute WP time bias if enabled
+        # Compute WP time bias if enabled (once, reused across layers)
         wp_time_bias = None
         if self.wp_time_bias is not None:
             wp_times_input = batch.get('wp_times', None)
             if wp_times_input is not None:
                 wp_time_bias = self.wp_time_bias(wp_times_input)
 
-        # Encoder layers
-        for layer in self.encoder_layers:
+        # Encoder layers with time bias only applied to first k layers
+        for layer_idx, layer in enumerate(self.encoder_layers):
+            # Only apply time bias to first wp_time_bias_layers layers
+            layer_wp_time_bias = wp_time_bias if layer_idx < self.wp_time_bias_layers else None
+
             wp_emb, cd_emb, global_emb, query_emb = layer(
                 wp_emb, cd_emb, global_emb, query_emb,
                 wp_mask=batch['wp_mask'],
                 cd_mask=cd_mask,
-                wp_time_bias=wp_time_bias,
+                wp_time_bias=layer_wp_time_bias,
             )
 
         # Output heads

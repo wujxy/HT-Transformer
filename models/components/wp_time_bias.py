@@ -42,6 +42,10 @@ class SignedTimeBucketBias(nn.Module):
         self.heads_shared = heads_shared
         self.max_time = max_time
 
+        # Performance note:
+        # heads_shared=True is cheaper and usually recommended for large N_wp.
+        # It reduces the number of bias lookups from H separate tables to 1 shared table.
+
         # Create bucket boundaries
         # We want symmetric buckets around 0 for signed time differences
         # delta_t ranges from -max_time to +max_time
@@ -104,6 +108,14 @@ class SignedTimeBucketBias(nn.Module):
             time_bias: (B, num_heads, N_wp, N_wp) additive bias for attention logits
         """
         B, N = wp_times.shape
+
+        # Fast disable mode: return zero bias for ablation/profiling
+        if self.num_buckets <= 1:
+            return torch.zeros(
+                B, self.num_heads, N, N,
+                device=wp_times.device,
+                dtype=wp_times.dtype,
+            )
 
         # Compute pairwise time differences: t_i - t_j
         # delta_t[i, j] = t_i - t_j (signed)

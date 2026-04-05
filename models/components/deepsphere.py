@@ -41,51 +41,53 @@ class RMSNorm(nn.Module):
         return x_norm * self.weight
 
 
-def build_local_neighbor_indices(
+def build_local_neighbor_graph(
     pixel_ids: torch.Tensor,
     full_knn_adj: torch.Tensor,
-    padding_value: int = -1
+    cd_mask: Optional[torch.Tensor] = None,
+    padding_value: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Build local neighbor indices based on active pixel IDs.
+    Build local neighbor graph once per batch.
 
-    Maps global HEALPix pixel IDs to local token indices for proper
-    neighborhood aggregation within each batch event.
+    Vectorized implementation using scatter/gather for GPU acceleration.
 
     Args:
-        pixel_ids: (B, N_cd) active HEALPix pixel IDs for this batch
-        full_knn_adj: (npix, k) global kNN adjacency table
-        padding_value: Value to use for invalid neighbors (default: -1)
+        pixel_ids: (B, N) global HEALPix pixel ids for active/padded CD tokens
+        full_knn_adj: (npix, k) global neighbor table
+        cd_mask: (B, N) bool, True = padding
+        padding_value: value for invalid local neighbor
 
     Returns:
-        local_neighbor_indices: (B, N_cd, k) local indices for neighbor lookup
-        valid_neighbor_mask: (B, N_cd, k) bool mask, True = valid neighbor
+        local_neighbor_indices: (B, N, k) local indices
+        valid_neighbor_mask: (B, N, k) bool, True = valid
     """
     B, N = pixel_ids.shape
     k = full_knn_adj.shape[1]
     device = pixel_ids.device
+    max_pix_id = full_knn_adj.shape[0]
 
     # Get global neighbors for each active pixel
-    # full_knn_adj[pixel_ids] -> (B, N, k) global pixel IDs of neighbors
     global_neighbors = full_knn_adj[pixel_ids]  # (B, N, k)
 
-    # Build global -> local mapping for each batch
-    # For each event, create a mapping from global pixel ID to local index
-    local_neighbor_indices = torch.full((B, N, k), padding_value, dtype=torch.long, device=device)
-    valid_neighbor_mask = torch.zeros((B, N, k), dtype=torch.bool, device=device)
+    # Build global -> local mapping table using scatter
+    # mapping[b, global_id] = local_idx (or padding_value if not present)
+    mapping = torch.full((B, max_pix_id), padding_value, dtype=torch.long, device=device)
 
-    for b in range(B):
-        # Create mapping: global_pixel -> local_idx for this event
-        # Use dictionary for O(1) lookup
-        global_to_local = {int(pid): i for i, pid in enumerate(pixel_ids[b])}
+    if cd_mask is not None:
+        # Only map valid (non-padding) tokens
+        valid_indices = (~cd_mask).nonzero(as_tuple=True)  # (batch_indices, seq_indices)
+        valid_pixel_ids = pixel_ids[valid_indices]
+        valid_local_indices = valid_indices[1]  # seq_indices are the local indices
+        batch_indices = valid_indices[0]
+        mapping[batch_indices, valid_pixel_ids] = valid_local_indices
+    else:
+        local_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
+        mapping.scatter_(1, pixel_ids, local_indices)
 
-        # Map each neighbor's global pixel ID to local index
-        for n in range(N):
-            for ki in range(k):
-                global_nbr = int(global_neighbors[b, n, ki])
-                if global_nbr in global_to_local:
-                    local_neighbor_indices[b, n, ki] = global_to_local[global_nbr]
-                    valid_neighbor_mask[b, n, ki] = True
+    # Lookup local indices for all global neighbors at once
+    local_neighbor_indices = mapping.gather(1, global_neighbors.view(B, -1)).view(B, N, k)
+    valid_neighbor_mask = local_neighbor_indices != padding_value
 
     return local_neighbor_indices, valid_neighbor_mask
 
@@ -135,6 +137,8 @@ class DeepSphereBlock(nn.Module):
         """
         Aggregate features from kNN neighbors with valid mask support.
 
+        Vectorized implementation using torch.gather (no Python loops).
+
         Args:
             x: (B, N, D) input features
             neighbor_indices: (B, N, k) local neighbor indices
@@ -146,32 +150,37 @@ class DeepSphereBlock(nn.Module):
         B, N, D = x.shape
         k = neighbor_indices.shape[-1]
 
-        # Gather neighbor features
-        neighbor_features = []
-        for b in range(B):
-            idx = neighbor_indices[b]  # (N, k)
-            nf = x[b][idx]  # (N, k, D)
-            neighbor_features.append(nf)
-        neighbor_features = torch.stack(neighbor_features, dim=0)  # (B, N, k, D)
+        # Vectorized gather: replace -1 with 0 to avoid index error, then mask
+        safe_indices = neighbor_indices.clamp(min=0)  # (B, N, k)
+
+        # Expand x for gathering: (B, N, D) -> (B, N, k, D)
+        x_expand = x.unsqueeze(2).expand(B, N, k, D)
+        gather_idx = safe_indices.unsqueeze(-1).expand(B, N, k, D)
+
+        # Gather neighbor features: (B, N, k, D)
+        neighbor_features = torch.gather(x_expand, dim=1, index=gather_idx)
 
         # Apply valid mask for aggregation
         if valid_mask is not None:
             # Masked mean pooling: only average valid neighbors
             valid_count = valid_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N, 1)
-            masked_features = neighbor_features * valid_mask.unsqueeze(-1).float()  # (B, N, k, D)
-            return masked_features.sum(dim=2) / valid_count  # (B, N, D)
+            masked_features = neighbor_features * valid_mask.unsqueeze(-1).to(x.dtype)  # (B, N, k, D)
+            return masked_features.sum(dim=2) / valid_count.to(x.dtype)  # (B, N, D)
         else:
             # Simple mean pooling over all k neighbors
             return neighbor_features.mean(dim=2)  # (B, N, D)
 
-    def forward(self, x: torch.Tensor, pixel_ids: Optional[torch.Tensor] = None,
-                full_knn_adj: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        local_neighbor_indices: Optional[torch.Tensor] = None,
+        valid_neighbor_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, N_cd, D) input CD patch embeddings
-            pixel_ids: (B, N_cd) or (N_cd,) HEALPix pixel IDs
-            full_knn_adj: (npix, k) global kNN adjacency table
-                          If None, uses fully-connected (fallback)
+            local_neighbor_indices: (B, N_cd, k) local neighbor indices
+            valid_neighbor_mask: (B, N_cd, k) bool mask for valid neighbors
 
         Returns:
             (B, N_cd, D) output embeddings
@@ -179,12 +188,8 @@ class DeepSphereBlock(nn.Module):
         # Pre-LN
         x_norm = self.norm(x)
 
-        if full_knn_adj is not None and pixel_ids is not None:
-            # Build local neighbor indices from active pixel IDs
-            local_neighbor_indices, valid_neighbor_mask = build_local_neighbor_indices(
-                pixel_ids, full_knn_adj, padding_value=-1
-            )
-            # Local aggregation with kNN
+        if local_neighbor_indices is not None:
+            # Local aggregation with precomputed kNN indices
             neighbor_agg = self._aggregate_neighbors(
                 x_norm, local_neighbor_indices, valid_neighbor_mask
             )
@@ -221,19 +226,41 @@ class DeepSphereEncoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, x: torch.Tensor, pixel_ids: Optional[torch.Tensor] = None,
-                full_knn_adj: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        pixel_ids: Optional[torch.Tensor] = None,
+        full_knn_adj: Optional[torch.Tensor] = None,
+        cd_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, N_cd, D) input embeddings
-            pixel_ids: HEALPix pixel IDs
+            pixel_ids: (B, N_cd) HEALPix pixel IDs
             full_knn_adj: (npix, k) global kNN adjacency table
+            cd_mask: (B, N_cd) bool mask, True = padding
 
         Returns:
             (B, N_cd, D) encoded embeddings
         """
+        # Build local neighbor graph once per batch (not per block)
+        local_neighbor_indices = None
+        valid_neighbor_mask = None
+
+        if full_knn_adj is not None and pixel_ids is not None:
+            local_neighbor_indices, valid_neighbor_mask = build_local_neighbor_graph(
+                pixel_ids=pixel_ids,
+                full_knn_adj=full_knn_adj,
+                cd_mask=cd_mask,
+                padding_value=-1,
+            )
+
         for block in self.blocks:
-            x = block(x, pixel_ids, full_knn_adj)
+            x = block(
+                x,
+                local_neighbor_indices=local_neighbor_indices,
+                valid_neighbor_mask=valid_neighbor_mask,
+            )
         return x
 
 
@@ -312,24 +339,30 @@ class CDCompression(nn.Module):
             # Fallback if healpy not available
             self.high_to_low = None
 
-    def _healpix_pool(self, x: torch.Tensor, pixel_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _healpix_pool(
+        self,
+        x: torch.Tensor,
+        pixel_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Pool high-resolution HEALPix patches to low-resolution.
 
         Args:
             x: (B, N_cd, D) patch embeddings
             pixel_ids: (B, N_cd) pixel IDs (in high-res nside)
+            mask: (B, N_cd) bool mask, True = padding token to ignore
 
         Returns:
             pooled: (B, N_out, D) pooled embeddings
-            pixel_ids_out: (B, N_out) low-res pixel IDs
+            pixel_ids_out: (B, N_out) low-res pixel IDs, padding = -1
         """
         B, N, D = x.shape
 
         if self.high_to_low is None:
             # Fallback: mean pooling
             return x.mean(dim=1, keepdim=True).expand(B, self.target_tokens, D), \
-                   torch.zeros(B, self.target_tokens, dtype=torch.long, device=x.device)
+                   torch.full((B, self.target_tokens), -1, dtype=torch.long, device=x.device)
 
         # Map high-res pixel IDs to low-res
         pixel_ids_flat = pixel_ids.view(-1).clamp(0, len(self.high_to_low) - 1)
@@ -347,24 +380,30 @@ class CDCompression(nn.Module):
             out = torch.zeros(npix_out, D, device=x.device, dtype=x.dtype)
             counts = torch.zeros(npix_out, device=x.device, dtype=x.dtype)
 
-            # Scatter add
-            low_ids_b = low_ids_flat[b]  # (N,)
-            x_b = x[b]  # (N, D)
+            # Get valid tokens (non-padding)
+            if mask is not None:
+                valid_tokens = ~mask[b]
+                x_b = x[b][valid_tokens]  # (N_valid, D)
+                low_ids_b = low_ids_flat[b][valid_tokens]  # (N_valid,)
+            else:
+                x_b = x[b]  # (N, D)
+                low_ids_b = low_ids_flat[b]  # (N,)
 
             # Only process valid (non-padding) entries
             valid = low_ids_b < npix_out
             low_ids_valid = low_ids_b[valid]
             x_valid = x_b[valid]
 
-            out.index_add_(0, low_ids_valid, x_valid)
-            counts.index_add_(0, low_ids_valid, torch.ones(len(low_ids_valid), device=x.device))
+            if len(low_ids_valid) > 0:
+                out.index_add_(0, low_ids_valid, x_valid)
+                counts.index_add_(0, low_ids_valid, torch.ones(len(low_ids_valid), device=x.device, dtype=x.dtype))
 
             # Average
-            mask = counts > 0
-            out[mask] = out[mask] / counts[mask].unsqueeze(-1)
+            active_mask = counts > 0
+            out[active_mask] = out[active_mask] / counts[active_mask].unsqueeze(-1)
 
             # Get active pixels
-            active = torch.where(mask)[0]
+            active = torch.where(active_mask)[0]
             if len(active) > 0:
                 pooled_list.append(out[active])
                 pixel_ids_out_list.append(active)
@@ -376,7 +415,8 @@ class CDCompression(nn.Module):
         # Pad to same length for batching
         max_len = max(p.shape[0] for p in pooled_list)
         pooled_padded = torch.zeros(B, max_len, D, device=x.device, dtype=x.dtype)
-        pixel_ids_padded = torch.zeros(B, max_len, dtype=torch.long, device=x.device)
+        # Use -1 for padding pixel ids (distinguishes from valid pixel 0)
+        pixel_ids_padded = torch.full((B, max_len), -1, dtype=torch.long, device=x.device)
 
         for b, (p, pid) in enumerate(zip(pooled_list, pixel_ids_out_list)):
             n = p.shape[0]
@@ -423,7 +463,7 @@ class CDCompression(nn.Module):
         if self.method == 'healpix_pool':
             if pixel_ids is None:
                 raise ValueError("healpix_pool method requires pixel_ids")
-            return self._healpix_pool(x, pixel_ids)
+            return self._healpix_pool(x, pixel_ids, mask=mask)
         elif self.method == 'attention_pool':
             return self._attention_pool(x, mask), None
         elif self.method == 'mean_pool':

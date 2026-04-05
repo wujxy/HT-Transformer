@@ -49,7 +49,8 @@ model:
   # WP time bias
   wp_time_bias: "signed_bucket"
   wp_num_time_buckets: 64
-  wp_time_bias_heads_shared: false
+  wp_time_bias_heads_shared: true  # cheaper for large N_wp
+  wp_time_bias_layers: 1           # only apply to first k layers (0 = disabled, allows SDPA fast path)
   # CD DeepSphere
   cd_deepsphere_layers: 4
   cd_deepsphere_hidden: 256
