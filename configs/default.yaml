@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v2"
+mission_name: "ht_transformer_v2_rotation"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -20,20 +20,20 @@ data:
     exit_z: "tt_exit_z"
     track_time: "track_time"
   max_hits: 20012
-  train_ratio: 0.86
+  train_ratio: 0.9
   val_ratio: 0.07
-  test_ratio: 0.07
+  test_ratio: 0.03
   nside: 8
   num_time_bins: 32
   t_max: 800.0
   auto_t_max: false
   preprocess_batch_size: 512
-  num_workers: 16
+  num_workers: 8
   prefetch_factor: 2
 
 model:
   d_model: 128
-  num_layers: 2
+  num_layers: 4
   num_heads: 4
   d_ff: 512
   num_queries: 2
@@ -72,7 +72,7 @@ loss:
 
 train:
   optimizer: "adamw"
-  lr: 1.0e-4
+  lr: 2.0e-4
   weight_decay: 1.0e-2
   scheduler: "warmup_plateau"
   warmup_epochs: 5
@@ -86,7 +86,9 @@ train:
   precision: "bf16"
   dropout: 0.1
   grad_clip: 1.0
-  batch_size: 2
+  batch_size: 128
+  val_batch_size: -1        # -1 = use batch_size, or set specific value (e.g., 4) for validation/test
+  cache_max_files: 4       # Max preprocessed batch files to cache in memory (reduce if OOM)
   num_epochs: 200
   save_every: 50
   eval_every: 5
@@ -95,7 +97,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 0
+  rotation_expand_times: 2
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false

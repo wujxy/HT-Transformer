@@ -248,9 +248,13 @@ class PreprocessedDataset(Dataset):
         else:
             self._indices = np.arange(self._total_events)
 
-        # File cache (LRU)
+        # File cache (LRU) - configurable to control memory usage
         self._file_cache: Dict[int, list] = {}
-        self._cache_max = max(16, len(self._events_per_file))  # cache all batch files
+        self._cache_max = max(16, len(self._events_per_file))  # default: cache all batch files
+
+    def set_cache_max(self, cache_max: int):
+        """Set maximum number of batch files to cache. Call immediately after creation."""
+        self._cache_max = max(1, min(cache_max, len(self._events_per_file)))
 
     def __len__(self) -> int:
         return len(self._indices)
@@ -329,10 +333,19 @@ def create_preprocessed_dataloaders(
     logger.info(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     batch_size = train_cfg['batch_size']
+    val_batch_size = train_cfg.get('val_batch_size', -1)
+    if val_batch_size <= 0:
+        val_batch_size = batch_size
+    cache_max_files = train_cfg.get('cache_max_files', 16)
 
     train_ds = PreprocessedDataset(preprocessed_dir, train_idx)
     val_ds = PreprocessedDataset(preprocessed_dir, val_idx)
     test_ds = PreprocessedDataset(preprocessed_dir, test_idx)
+
+    # Set cache limit to control memory usage (important for multi-GPU)
+    train_ds.set_cache_max(cache_max_files)
+    val_ds.set_cache_max(min(cache_max_files, 4))  # Use smaller cache for val/test
+    test_ds.set_cache_max(min(cache_max_files, 4))
 
     # Disable num_workers when using accelerate to avoid fork/deadlock issues
     use_accelerate = train_cfg.get('use_accelerate', False)
@@ -347,11 +360,12 @@ def create_preprocessed_dataloaders(
                               collate_fn=collate_fn, num_workers=num_workers,
                               pin_memory=True, persistent_workers=num_workers > 0,
                               prefetch_factor=prefetch)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+    # Use val_batch_size for val/test (can be larger since no gradients, or smaller to save memory)
+    val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False,
                             collate_fn=collate_fn, num_workers=num_workers,
                             pin_memory=True, persistent_workers=num_workers > 0,
                             prefetch_factor=prefetch)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=val_batch_size, shuffle=False,
                              collate_fn=collate_fn, num_workers=num_workers,
                              pin_memory=True, persistent_workers=num_workers > 0,
                              prefetch_factor=prefetch)
