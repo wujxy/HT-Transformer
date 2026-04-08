@@ -587,13 +587,23 @@ class Trainer:
         total_dir = 0
         n_batches = 0
 
+        # Profiling accumulators (ms)
+        t_data_total = 0.0   # dataloader wait + collate (before h2d)
+        t_h2d_total = 0.0    # host→device transfer
+        t_fwd_total = 0.0    # model forward + loss
+        t_bwd_total = 0.0    # backward + optimizer step
+
         total_steps = len(self.train_loader)
         pbar = tqdm(self.train_loader, total=total_steps,
                     desc=f"Epoch {epoch+1}", disable=not self._is_main)
 
         for batch in pbar:
+            t0 = time.time()
+
+            # --- H2D transfer ---
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
+            t1 = time.time()
 
             if self.use_accelerate:
                 with self.accelerator.accumulate(self.model):
@@ -602,6 +612,8 @@ class Trainer:
                         outputs['pred_u1'], outputs['pred_u2'],
                         batch['u1'], batch['u2']
                     )
+                    t2 = time.time()
+
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         grad_clip = self.train_cfg.get('grad_clip', 1.0)
@@ -609,6 +621,7 @@ class Trainer:
                         self.optimizer.step()
                         self.scheduler.step_batch()
                         self.optimizer.zero_grad()
+                    t3 = time.time()
             else:
                 with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(batch)
@@ -616,6 +629,7 @@ class Trainer:
                         outputs['pred_u1'], outputs['pred_u2'],
                         batch['u1'], batch['u2']
                     )
+                    t2 = time.time()
 
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
@@ -625,6 +639,7 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.scheduler.step_batch()
+                t3 = time.time()
 
             total_loss += loss_dict['loss_total']
             total_ang += loss_dict['loss_ang']
@@ -633,9 +648,29 @@ class Trainer:
             n_batches += 1
             self.global_step += 1
 
+            # Accumulate profiling (t0 = after dataloader yield, t1 = after h2d, etc.)
+            dt_h2d = (t1 - t0) * 1000
+            dt_fwd = (t2 - t1) * 1000
+            dt_bwd = (t3 - t2) * 1000
+            t_h2d_total += dt_h2d
+            t_fwd_total += dt_fwd
+            t_bwd_total += dt_bwd
+
             if self._is_main:
+                if n_batches <= 5 or n_batches % 20 == 0:
+                    pbar.write(f"[prof] h2d={dt_h2d:.0f}ms  fwd={dt_fwd:.0f}ms  "
+                               f"bwd={dt_bwd:.0f}ms  loss={loss_dict['loss_total']:.4f}")
                 pbar.set_postfix(loss=f"{loss_dict['loss_total']:.4f}",
                                  ang=f"{loss_dict['loss_ang']:.4f}")
+
+        if self._is_main and n_batches > 0:
+            logger.info(
+                f"[prof epoch] avg/step: h2d={t_h2d_total/n_batches:.0f}ms "
+                f"fwd={t_fwd_total/n_batches:.0f}ms "
+                f"bwd={t_bwd_total/n_batches:.0f}ms "
+                f"(total={t_h2d_total+t_fwd_total+t_bwd_total:.0f}ms "
+                f"for {n_batches} steps)"
+            )
 
         return {
             'loss_total': total_loss / max(1, n_batches),

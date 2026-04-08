@@ -34,7 +34,7 @@ data:
 
 model:
   d_model: 128
-  num_layers: 4
+  num_layers: 2
   num_heads: 4
   d_ff: 512
   num_queries: 2
@@ -88,7 +88,7 @@ train:
   dropout: 0.1
   grad_clip: 1.0
   batch_size: 64
-  num_epochs: 200
+  num_epochs: 5
   save_every: 50
   eval_every: 5
   use_accelerate: true
