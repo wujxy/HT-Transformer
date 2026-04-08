@@ -607,6 +607,11 @@ class CDCompression(nn.Module):
             out_mask: (B, npix_out) bool mask, True = inactive
         """
         if self.method == 'healpix_pool':
+            # Fast path: skip compression when nside_in == nside_out
+            if self.nside_in == self.nside_out:
+                out_mask = mask.clone() if mask is not None else torch.zeros(
+                    x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)
+                return x, out_mask
             # Stage B: Dense fixed-grid pooling (no pixel_ids needed)
             pooled, out_mask = self._healpix_pool_dense_stageb(x, mask=mask)
             return pooled, out_mask

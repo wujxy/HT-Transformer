@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3"
+mission_name: "ht_transformer_v3_rotation"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -27,7 +27,7 @@ data:
   num_time_bins: 32
   t_max: 800.0
   auto_t_max: false
-  max_events: 5000             # max events to preprocess (-1 = all events in h5 files)
+  max_events: -1       # max events to preprocess (-1 = all events in h5 files)
   preprocess_batch_size: 512
   num_workers: 8
   prefetch_factor: 2
@@ -62,7 +62,7 @@ model:
   cd_deepsphere_hidden: 256
   cd_compression: "healpix_pool"
   cd_fusion_tokens: 128
-  cd_compression_nside: 4
+  cd_compression_nside: 8
   # Global normalization
   norm_type: "rmsnorm"
 
@@ -73,7 +73,7 @@ loss:
 
 train:
   optimizer: "adamw"
-  lr: 2.0e-4
+  lr: 1.0e-4
   weight_decay: 1.0e-2
   scheduler: "warmup_plateau"
   warmup_epochs: 5
@@ -96,7 +96,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 0
+  rotation_expand_times: 2
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false
