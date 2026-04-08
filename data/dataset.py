@@ -508,7 +508,16 @@ def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,
     mission = config.get('mission_name', 'ht_transformer_v1')
     output_base = config.get('output_path', 'output')
     preprocessed_dir = os.path.join(output_base, mission, 'preprocessed')
+
+    # New format: meta.json + split HDF5 files
+    meta_path = os.path.join(preprocessed_dir, 'meta.json')
+    # Old format: manifest.json + batch .pt or data.h5
     manifest_path = os.path.join(preprocessed_dir, 'manifest.json')
+
+    if os.path.exists(meta_path):
+        logger.info(f"Found preprocessed data at {preprocessed_dir}, using directly")
+        from data.preprocess import create_preprocessed_dataloaders
+        return create_preprocessed_dataloaders(config, preprocessed_dir)
 
     if os.path.exists(manifest_path):
         logger.info(f"Found preprocessed data at {preprocessed_dir}, using directly")

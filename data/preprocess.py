@@ -1,30 +1,26 @@
 """
-Preprocessing: tokenize all H5 events and save to disk as HDF5 chunked storage.
+Preprocessing: tokenize H5 events → split-level HDF5 files.
 
-Usage:
-    python RunModule.py --config configs/default.yaml --Preprocess
+Offline build produces:
+    output/{mission}/preprocessed/
+    ├── meta.json
+    ├── cd_unit_vecs.npy   (npix, 3) float32
+    ├── train.h5
+    ├── val.h5
+    └── test.h5
 
-This reads raw H5 files, performs full tokenization (WP + CD aggregation),
-and saves results as a single HDF5 file with chunked datasets for O(1) random access.
-
-Training will auto-detect the preprocessed data and skip tokenization.
-
-Storage layout (data.h5):
-    /metadata/cd_unit_vecs  (npix, 3)     shared across all events
-    /cd/stats               (N, npix, 4)   chunked per event
-    /cd/time_bins           (N, npix, 32)  chunked per event, gzip
-    /cd/mask                (N, npix)      chunked per event
-    /wp/tokens_flat         (total*5,)     flat concatenated WP tokens
-    /wp/offsets             (N, 2)         [start, n_hits] per event
-    /labels/u1              (N, 3)
-    /labels/u2              (N, 3)
-    /labels/p1              (N, 3)
-    /labels/p2              (N, 3)
+Each HDF5 file layout:
+    /cd_stats       (N, npix, 4)    float16
+    /cd_time_bins   (N, npix, 32)   float16
+    /wp_offsets     (N+1,)          int64    cumulative
+    /wp_tokens_flat (total_wp*5,)   float16
+    /labels         (N, 12)         float16  [u1(3), u2(3), p1(3), p2(3)]
 """
 
 import os
 import json
 import hashlib
+import functools
 import numpy as np
 import torch
 import h5py
@@ -34,18 +30,12 @@ from loguru import logger
 from tqdm import tqdm
 
 from data.dataset import (
-    H5EndpointDataset, collate_fn, discover_h5_files,
+    H5EndpointDataset, discover_h5_files,
 )
 from data.augmentation import random_rotation_matrix
 
 
-def identity_collate_fn(batch):
-    """Identity collate for preprocessing: return events as-is without batching."""
-    return batch
-
-
 def _config_hash(config: dict) -> str:
-    """Simple hash of config keys that affect tokenization."""
     relevant = json.dumps({
         'nside': config['data'].get('nside', 8),
         'num_time_bins': config['data'].get('num_time_bins', 32),
@@ -54,118 +44,71 @@ def _config_hash(config: dict) -> str:
     return hashlib.md5(relevant.encode()).hexdigest()[:8]
 
 
+def _identity_collate(batch):
+    return batch
+
+
 # ---------------------------------------------------------------------------
-# HDF5 write helpers
+# Write helper: tokenized events → one split HDF5 file
 # ---------------------------------------------------------------------------
 
-def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins):
-    """Write a list of tokenized event dicts into an HDF5 file."""
-    n = len(tokenized_events)
-    end_idx = start_idx + n
+def _write_split_hdf5(h5_path, tokenized_events, npix, num_time_bins):
+    """Write a list of tokenized event dicts into one split HDF5 file.
 
-    # Collect arrays for batch write
-    cd_stats = np.zeros((n, npix, 4), dtype=np.float32)
-    cd_time_bins = np.zeros((n, npix, num_time_bins), dtype=np.float32)
-    cd_mask = np.zeros((n, npix), dtype=bool)
-    u1 = np.zeros((n, 3), dtype=np.float32)
-    u2 = np.zeros((n, 3), dtype=np.float32)
-    p1 = np.zeros((n, 3), dtype=np.float32)
-    p2 = np.zeros((n, 3), dtype=np.float32)
+    Stores only the minimal fields: cd_stats, cd_time_bins, wp tokens, labels.
+    No cd_mask (derivable), no cd_unit_vecs (global), no cd_times_mean (derivable).
+    All float data stored as float16.
+    """
+    N = len(tokenized_events)
+    if N == 0:
+        return 0
+
+    cd_stats = np.zeros((N, npix, 4), dtype=np.float16)
+    cd_time_bins = np.zeros((N, npix, num_time_bins), dtype=np.float16)
+    labels = np.zeros((N, 12), dtype=np.float16)
 
     wp_flat_parts = []
-    wp_offsets = np.zeros((n, 2), dtype=np.int64)
+    wp_counts = np.zeros(N, dtype=np.int64)
 
     for i, ev in enumerate(tokenized_events):
-        # CD data
-        cd_stats[i] = ev['cd_stats'].numpy() if isinstance(ev['cd_stats'], torch.Tensor) else ev['cd_stats']
-        cd_time_bins[i] = ev['cd_time_bins'].numpy() if isinstance(ev['cd_time_bins'], torch.Tensor) else ev['cd_time_bins']
-        cd_mask[i] = ev['cd_mask'].numpy() if isinstance(ev['cd_mask'], torch.Tensor) else ev['cd_mask']
+        # CD
+        s = ev['cd_stats']
+        cd_stats[i] = s.numpy().astype(np.float16) if isinstance(s, torch.Tensor) else s.astype(np.float16)
+        t = ev['cd_time_bins']
+        cd_time_bins[i] = t.numpy().astype(np.float16) if isinstance(t, torch.Tensor) else t.astype(np.float16)
 
-        # Labels
-        for field, arr in [('u1', u1), ('u2', u2), ('p1', p1), ('p2', p2)]:
-            val = ev[field]
-            arr[i] = val.numpy() if isinstance(val, torch.Tensor) else val
+        # Labels: [u1, u2, p1, p2]
+        for j, key in enumerate(['u1', 'u2', 'p1', 'p2']):
+            v = ev[key]
+            labels[i, j*3:(j+1)*3] = v.numpy().astype(np.float16) if isinstance(v, torch.Tensor) else v.astype(np.float16)
 
-        # WP tokens (variable length)
-        wp_tok = ev['wp_tokens']
-        wp_tok_np = wp_tok.numpy() if isinstance(wp_tok, torch.Tensor) else wp_tok
-        n_wp = wp_tok_np.shape[0]
-
+        # WP tokens
+        wp = ev['wp_tokens']
+        wp_np = wp.numpy() if isinstance(wp, torch.Tensor) else wp
+        n_wp = wp_np.shape[0]
+        wp_counts[i] = n_wp
         if n_wp > 0:
-            flat = wp_tok_np.reshape(-1).astype(np.float32)
-            wp_flat_parts.append(flat)
-            wp_offsets[i] = [0, n_wp]  # will be fixed below
-        else:
-            wp_offsets[i] = [0, 0]
+            wp_flat_parts.append(wp_np.reshape(-1).astype(np.float16))
 
-    # Batch write fixed-shape datasets
-    h5f['cd/stats'][start_idx:end_idx] = cd_stats
-    h5f['cd/time_bins'][start_idx:end_idx] = cd_time_bins
-    h5f['cd/mask'][start_idx:end_idx] = cd_mask
-    h5f['labels/u1'][start_idx:end_idx] = u1
-    h5f['labels/u2'][start_idx:end_idx] = u2
-    h5f['labels/p1'][start_idx:end_idx] = p1
-    h5f['labels/p2'][start_idx:end_idx] = p2
+    # Cumulative offsets (N+1,)
+    wp_offsets = np.zeros(N + 1, dtype=np.int64)
+    np.cumsum(wp_counts, out=wp_offsets[1:])
 
-    # Append WP flat tokens and compute correct offsets
-    if wp_flat_parts:
-        all_flat = np.concatenate(wp_flat_parts)
-        old_size = h5f['wp/tokens_flat'].shape[0]
-        h5f['wp/tokens_flat'].resize(old_size + all_flat.size, axis=0)
-        h5f['wp/tokens_flat'][old_size:old_size + all_flat.size] = all_flat
+    # Write HDF5 with maxshape for resize support (needed for augmentation append)
+    with h5py.File(h5_path, 'w') as f:
+        f.create_dataset('cd_stats', data=cd_stats, dtype='float16',
+                         maxshape=(None, npix, 4))
+        f.create_dataset('cd_time_bins', data=cd_time_bins, dtype='float16',
+                         maxshape=(None, npix, num_time_bins))
+        f.create_dataset('labels', data=labels, dtype='float16',
+                         maxshape=(None, 12))
+        f.create_dataset('wp_offsets', data=wp_offsets, dtype='int64',
+                         maxshape=(None,))
+        wp_flat = np.concatenate(wp_flat_parts) if wp_flat_parts else np.zeros(0, dtype=np.float16)
+        f.create_dataset('wp_tokens_flat', data=wp_flat, dtype='float16',
+                         maxshape=(None,))
 
-    # Fix offsets to point into the flat array
-    wp_offset_pos = 0
-    for i, ev in enumerate(tokenized_events):
-        wp_tok = ev['wp_tokens']
-        wp_tok_np = wp_tok.numpy() if isinstance(wp_tok, torch.Tensor) else wp_tok
-        n_wp = wp_tok_np.shape[0]
-        if n_wp > 0:
-            wp_offsets[i] = [wp_offset_pos, n_wp]
-            wp_offset_pos += n_wp
-        else:
-            wp_offsets[i] = [wp_offset_pos, 0]
-
-    h5f['wp/offsets'][start_idx:end_idx] = wp_offsets
-
-
-def _create_hdf5_datasets(h5f, total_events, npix, num_time_bins):
-    """Create HDF5 dataset placeholders for all fields."""
-    g_meta = h5f.create_group('metadata')
-
-    # CD fixed-shape datasets: chunked per event for O(1) random access
-    g_cd = h5f.create_group('cd')
-    g_cd.create_dataset(
-        'stats', shape=(total_events, npix, 4), dtype='float32',
-        chunks=(1, npix, 4), compression='gzip', compression_opts=1,
-    )
-    g_cd.create_dataset(
-        'time_bins', shape=(total_events, npix, num_time_bins), dtype='float32',
-        chunks=(1, npix, num_time_bins), compression='gzip', compression_opts=1,
-    )
-    g_cd.create_dataset(
-        'mask', shape=(total_events, npix), dtype='bool',
-        chunks=(1, npix),
-    )
-
-    # WP variable-length: flat array + offset index
-    g_wp = h5f.create_group('wp')
-    g_wp.create_dataset(
-        'tokens_flat', shape=(0,), dtype='float32',
-        maxshape=(None,), chunks=(1024 * 1024,),
-    )
-    g_wp.create_dataset(
-        'offsets', shape=(total_events, 2), dtype='int64',
-        chunks=(256, 2),
-    )
-
-    # Labels
-    g_labels = h5f.create_group('labels')
-    for name in ('u1', 'u2', 'p1', 'p2'):
-        g_labels.create_dataset(
-            name, shape=(total_events, 3), dtype='float32',
-            chunks=(256, 3),
-        )
+    return N
 
 
 # ---------------------------------------------------------------------------
@@ -173,61 +116,44 @@ def _create_hdf5_datasets(h5f, total_events, npix, num_time_bins):
 # ---------------------------------------------------------------------------
 
 def preprocess(config: dict):
-    """Preprocess all H5 events into tokenized HDF5 chunked storage."""
+    """Build split-level HDF5 files from raw H5 events."""
     data_cfg = config['data']
 
-    # Setup dirs
     mission = config.get('mission_name', 'ht_transformer_v1')
     output_base = config.get('output_path', 'output')
     preprocessed_dir = os.path.join(output_base, mission, 'preprocessed')
     os.makedirs(preprocessed_dir, exist_ok=True)
 
-    manifest_path = os.path.join(preprocessed_dir, 'manifest.json')
-    h5_path = os.path.join(preprocessed_dir, 'data.h5')
+    meta_path = os.path.join(preprocessed_dir, 'meta.json')
 
-    # Check existing cache
-    if os.path.exists(h5_path) and os.path.exists(manifest_path):
-        with open(manifest_path, 'r') as f:
-            existing_manifest = json.load(f)
-        existing_repr = existing_manifest.get('cd_representation', 'active_patch')
-        if existing_repr != 'dense_healpix':
-            raise RuntimeError(
-                f"Existing preprocessed cache is old '{existing_repr}' format. "
-                f"Stage B requires 'dense_healpix' format. "
-                f"Please delete {preprocessed_dir} and re-run preprocessing."
-            )
+    # Check existing
+    if os.path.exists(meta_path):
         logger.info(f"Preprocessed data already exists at {preprocessed_dir}")
         logger.info("Delete the directory to re-run preprocessing.")
         return
 
-    # --- Initialize geometry + HEALPix ---
+    # --- Geometry + HEALPix ---
     from geometry.detector_geometry import DualPMTPositionLookup
     from geometry.healpix_mapper import HEALPixMapper
 
-    geometry = DualPMTPositionLookup(
-        data_cfg['geometry_cd'], data_cfg['geometry_wp'])
-
+    geometry = DualPMTPositionLookup(data_cfg['geometry_cd'], data_cfg['geometry_wp'])
     cd_unit_vecs = geometry.cd_position_array.copy()
     norms = np.linalg.norm(cd_unit_vecs, axis=1, keepdims=True)
     valid = (norms.squeeze() > 0)
     cd_unit_vecs[valid] = cd_unit_vecs[valid] / norms[valid]
 
-    healpix = HEALPixMapper(
-        nside=data_cfg['nside'],
-        cd_unit_vecs=cd_unit_vecs,
-    )
+    healpix = HEALPixMapper(nside=data_cfg['nside'], cd_unit_vecs=cd_unit_vecs)
     healpix.build_knn_adjacency(k=config['model']['cd_knn_k'])
 
     npix = 12 * data_cfg['nside'] * data_cfg['nside']
     num_time_bins = data_cfg['num_time_bins']
 
-    # --- Discover H5 files ---
+    # --- Discover + count events ---
     h5_files = discover_h5_files(data_cfg['h5_path'])
     if len(h5_files) == 0:
         raise FileNotFoundError(f"No H5 files found for: {data_cfg['h5_path']}")
     logger.info(f"Discovered {len(h5_files)} H5 file(s)")
 
-    # Count events per file
     km = data_cfg['h5_key_map']
     events_per_file = []
     total_events = 0
@@ -236,7 +162,6 @@ def preprocess(config: dict):
             n = f[km['nhits']].shape[0]
             events_per_file.append(n)
             total_events += n
-    logger.info(f"Total events in H5 files: {total_events}")
 
     # Apply max_events limit
     max_events = data_cfg.get('max_events', -1)
@@ -255,207 +180,225 @@ def preprocess(config: dict):
     else:
         logger.info(f"Processing all {total_events} events")
 
-    # --- Create dataset with selected events (no split) ---
+    # --- Split indices ---
+    ratios = [data_cfg['train_ratio'], data_cfg['val_ratio'], data_cfg['test_ratio']]
     all_indices = np.arange(total_events)
-    dataset = H5EndpointDataset(
-        h5_files, config, geometry, healpix,
-        indices=all_indices, is_train=False,
-        events_per_file=events_per_file,
-    )
+    np.random.seed(config['train'].get('seed', 42))
+    np.random.shuffle(all_indices)
 
-    # --- Tokenize and save ---
+    n_train = int(ratios[0] * total_events)
+    n_val = int(ratios[1] * total_events)
+    train_idx = all_indices[:n_train]
+    val_idx = all_indices[n_train:n_train + n_val]
+    test_idx = all_indices[n_train + n_val:]
+    logger.info(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+    # --- Augmentation ---
     expand_times = config.get('augmentation', {}).get('rotation_expand_times', 0)
-    total_with_aug = total_events * (1 + expand_times)
 
-    logger.info(f"Creating HDF5 file: {h5_path} ({total_with_aug} events)")
-    with h5py.File(h5_path, 'w') as h5f:
-        _create_hdf5_datasets(h5f, total_with_aug, npix, num_time_bins)
+    # --- Tokenize and write each split ---
+    num_workers = data_cfg.get('num_workers', 4)
+    prefetch = data_cfg.get('prefetch_factor', 2) if num_workers > 0 else None
+    batch_size = data_cfg.get('preprocess_batch_size', 512)
 
-        # Write shared metadata
-        h5f['metadata'].create_dataset(
-            'cd_unit_vecs', data=healpix.cd_unit_vecs.astype(np.float32))
-        h5f['metadata'].attrs['nside'] = data_cfg['nside']
-        h5f['metadata'].attrs['npix'] = npix
-        h5f['metadata'].attrs['num_time_bins'] = num_time_bins
-
-        # --- Phase 1: Write original events ---
-        num_workers = data_cfg.get('num_workers', 4)
-        prefetch = data_cfg.get('prefetch_factor', 2) if num_workers > 0 else None
-
-        loader = DataLoader(
-            dataset,
-            batch_size=data_cfg.get('preprocess_batch_size', 512),
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=identity_collate_fn,
-            pin_memory=False,
-            prefetch_factor=prefetch,
-            persistent_workers=num_workers > 0,
-        )
-
-        logger.info(f"Tokenizing original {total_events} events...")
-        event_idx = 0
-        for batch_data in tqdm(loader, desc="Tokenizing"):
-            n = len(batch_data)
-            _write_events_to_hdf5(h5f, batch_data, event_idx, npix, num_time_bins)
-            event_idx += n
-
-        # --- Phase 2: Rotation augmentation expansions ---
-        rotation_matrices = []
-        for exp in range(expand_times):
-            R = random_rotation_matrix()
-            rotation_matrices.append(R)
-            logger.info(f"Rotation expansion {exp+1}/{expand_times}")
-
-            rot_dataset = H5EndpointDataset(
+    def _tokenize_and_write(split_name, indices_list, h5_path, apply_rotation=False):
+        """Tokenize events for a list of index arrays and write to one HDF5 file."""
+        all_events = []
+        for idx_arr in indices_list:
+            ds = H5EndpointDataset(
                 h5_files, config, geometry, healpix,
-                indices=all_indices, is_train=False,
+                indices=idx_arr, is_train=False,
                 events_per_file=events_per_file,
-                apply_rotation_aug=True,
+                apply_rotation_aug=apply_rotation,
             )
-
-            rot_loader = DataLoader(
-                rot_dataset,
-                batch_size=data_cfg.get('preprocess_batch_size', 512),
-                shuffle=False,
-                num_workers=num_workers,
-                collate_fn=identity_collate_fn,
-                pin_memory=False,
-                prefetch_factor=prefetch,
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, collate_fn=_identity_collate,
+                pin_memory=False, prefetch_factor=prefetch,
                 persistent_workers=num_workers > 0,
             )
+            for batch_data in tqdm(loader, desc=f"Tokenizing {split_name}"):
+                all_events.extend(batch_data)
 
-            for batch_data in tqdm(rot_loader, desc=f"Rotation {exp+1}/{expand_times}"):
-                n = len(batch_data)
-                _write_events_to_hdf5(h5f, batch_data, event_idx, npix, num_time_bins)
-                event_idx += n
+        n = _write_split_hdf5(h5_path, all_events, npix, num_time_bins)
+        logger.info(f"  {split_name}: {n} events → {h5_path}")
+        return n
 
-    # --- Save manifest ---
-    manifest = {
-        'original_events': total_events,
-        'expand_times': expand_times,
-        'total_events': total_with_aug,
-        'batch_size': data_cfg.get('preprocess_batch_size', 512),
-        'config_hash': _config_hash(config),
+    # Write train (original only first)
+    n_train_total = _tokenize_and_write(
+        'train', [train_idx],
+        os.path.join(preprocessed_dir, 'train.h5'),
+        apply_rotation=False,
+    )
+    # Append rotation-augmented copies to train.h5
+    for exp in range(expand_times):
+        logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
+        aug_events = []
+        ds = H5EndpointDataset(
+            h5_files, config, geometry, healpix,
+            indices=train_idx, is_train=False,
+            events_per_file=events_per_file,
+            apply_rotation_aug=True,
+        )
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=_identity_collate,
+            pin_memory=False, prefetch_factor=prefetch,
+            persistent_workers=num_workers > 0,
+        )
+        for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
+            aug_events.extend(batch_data)
+
+        _append_to_split_hdf5(
+            os.path.join(preprocessed_dir, 'train.h5'),
+            aug_events, npix, num_time_bins,
+        )
+        n_train_total += len(aug_events)
+    if expand_times > 0:
+        logger.info(f"  train (with aug): {n_train_total} events")
+
+    n_val_total = _tokenize_and_write(
+        'val', [val_idx],
+        os.path.join(preprocessed_dir, 'val.h5'),
+    )
+    n_test_total = _tokenize_and_write(
+        'test', [test_idx],
+        os.path.join(preprocessed_dir, 'test.h5'),
+    )
+
+    # --- Save shared metadata ---
+    np.save(os.path.join(preprocessed_dir, 'cd_unit_vecs.npy'),
+            healpix.cd_unit_vecs.astype(np.float32))
+
+    meta = {
+        'format': 'split_hdf5',
         'cd_representation': 'dense_healpix',
-        'format': 'hdf5',
         'nside': data_cfg['nside'],
         'npix': npix,
         'num_time_bins': num_time_bins,
-        'h5_file': 'data.h5',
-        'rotation_matrices': [R.tolist() for R in rotation_matrices],
+        'train_events': n_train_total,
+        'val_events': n_val_total,
+        'test_events': n_test_total,
+        'original_events': total_events,
+        'expand_times': expand_times,
+        'config_hash': _config_hash(config),
     }
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
 
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+    logger.info(f"Preprocessing complete: {preprocessed_dir}")
+    logger.info(f"  train={n_train_total}, val={n_val_total}, test={n_test_total}")
 
-    logger.info(f"Preprocessing complete: {h5_path}")
-    logger.info(f"  Original: {total_events}, expand_times={expand_times}, "
-                f"total={total_with_aug}")
-    logger.info(f"Manifest saved: {manifest_path}")
+
+def _append_to_split_hdf5(h5_path, tokenized_events, npix, num_time_bins):
+    """Append more events to an existing split HDF5 file."""
+    if not tokenized_events:
+        return
+    N = len(tokenized_events)
+
+    cd_stats = np.zeros((N, npix, 4), dtype=np.float16)
+    cd_time_bins = np.zeros((N, npix, num_time_bins), dtype=np.float16)
+    labels = np.zeros((N, 12), dtype=np.float16)
+    wp_flat_parts = []
+    wp_counts = np.zeros(N, dtype=np.int64)
+
+    for i, ev in enumerate(tokenized_events):
+        s = ev['cd_stats']
+        cd_stats[i] = s.numpy().astype(np.float16) if isinstance(s, torch.Tensor) else s.astype(np.float16)
+        t = ev['cd_time_bins']
+        cd_time_bins[i] = t.numpy().astype(np.float16) if isinstance(t, torch.Tensor) else t.astype(np.float16)
+        for j, key in enumerate(['u1', 'u2', 'p1', 'p2']):
+            v = ev[key]
+            labels[i, j*3:(j+1)*3] = v.numpy().astype(np.float16) if isinstance(v, torch.Tensor) else v.astype(np.float16)
+        wp = ev['wp_tokens']
+        wp_np = wp.numpy() if isinstance(wp, torch.Tensor) else wp
+        n_wp = wp_np.shape[0]
+        wp_counts[i] = n_wp
+        if n_wp > 0:
+            wp_flat_parts.append(wp_np.reshape(-1).astype(np.float16))
+
+    new_offsets = np.zeros(N + 1, dtype=np.int64)
+    np.cumsum(wp_counts, out=new_offsets[1:])
+
+    with h5py.File(h5_path, 'a') as f:
+        old_N = f['cd_stats'].shape[0]
+        # Resize and append fixed-shape datasets
+        f['cd_stats'].resize(old_N + N, axis=0)
+        f['cd_stats'][old_N:] = cd_stats
+        f['cd_time_bins'].resize(old_N + N, axis=0)
+        f['cd_time_bins'][old_N:] = cd_time_bins
+        f['labels'].resize(old_N + N, axis=0)
+        f['labels'][old_N:] = labels
+
+        # Append WP tokens
+        old_flat_size = f['wp_tokens_flat'].shape[0]
+        if wp_flat_parts:
+            new_flat = np.concatenate(wp_flat_parts)
+            f['wp_tokens_flat'].resize(old_flat_size + new_flat.size, axis=0)
+            f['wp_tokens_flat'][old_flat_size:] = new_flat
+
+        # Rewrite offsets (need to merge old + new)
+        old_offsets = f['wp_offsets'][:]
+        # Shift new offsets by total WP count from old
+        total_wp_old = int(old_offsets[-1])
+        new_offsets_shifted = new_offsets + total_wp_old
+        merged = np.concatenate([old_offsets[:-1], new_offsets_shifted])
+        del f['wp_offsets']
+        f.create_dataset('wp_offsets', data=merged, dtype='int64')
 
 
 # ---------------------------------------------------------------------------
-# HDF5-backed Dataset for training
+# Thin reader for training
 # ---------------------------------------------------------------------------
 
-class PreprocessedDataset(Dataset):
-    """
-    Dataset that reads pre-tokenized events from HDF5 chunked storage.
+class SplitDataset(Dataset):
+    """Thin reader: opens one split HDF5, reads by sequential index.
 
-    Uses lazy file open: each worker process opens its own h5py.File handle
-    on first __getitem__ call, avoiding fork-safety issues with h5py.
-
-    Memory usage is bounded by the HDF5 chunk cache (rdcc_nbytes, default 256 MB).
+    Each worker opens its own file handle lazily (fork-safe).
+    Only stores the minimal fields; all derived fields come from collate_fn.
     """
 
-    def __init__(self, h5_path: str, indices: Optional[np.ndarray] = None,
-                 cache_nbytes: int = 256 * 1024 * 1024):
-        """
-        Args:
-            h5_path: path to data.h5 file
-            indices: event-level indices to use (for train/val/test split)
-            cache_nbytes: max HDF5 chunk cache size in bytes (default 256 MB)
-        """
+    def __init__(self, h5_path: str):
         self._h5_path = h5_path
-        self._cache_nbytes = cache_nbytes
-
-        # Lazy-open: file handle created per-worker in _ensure_open()
         self._file = None
 
-        # Read metadata from file (open briefly, then close)
+        # Read metadata once (small)
         with h5py.File(h5_path, 'r') as f:
-            self._cd_unit_vecs = torch.from_numpy(
-                np.array(f['metadata/cd_unit_vecs']))  # (npix, 3), ~9 KB
-            self._npix = int(f['metadata'].attrs['npix'])
-            self._wp_offsets = f['wp/offsets'][:]       # (N, 2) int64, ~3.8 MB
-            self._total_events = f['cd/stats'].shape[0]
-
-        # Cached constant tensors
-        self._cd_pixel_ids = torch.arange(self._npix, dtype=torch.long)
-
-        # Apply indices
-        if indices is not None:
-            self._indices = indices
-        else:
-            self._indices = np.arange(self._total_events)
+            self._n_events = f['cd_stats'].shape[0]
+            self._wp_offsets = f['wp_offsets'][:]  # (N+1,) int64
 
     def _ensure_open(self):
-        """Open HDF5 file handle lazily (per-worker, fork-safe)."""
         if self._file is None:
-            self._file = h5py.File(
-                self._h5_path, 'r',
-                rdcc_nbytes=self._cache_nbytes, rdcc_w0=0.5,
-            )
+            self._file = h5py.File(self._h5_path, 'r', rdcc_nbytes=64 * 1024 * 1024)
 
     def __len__(self) -> int:
-        return len(self._indices)
+        return self._n_events
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         self._ensure_open()
-
-        global_idx = int(self._indices[idx])
         f = self._file
 
-        # --- CD data: read one chunk per field ---
-        cd_stats = torch.from_numpy(np.array(f['cd/stats'][global_idx]))        # (npix, 4)
-        cd_time_bins = torch.from_numpy(np.array(f['cd/time_bins'][global_idx]))# (npix, 32)
-        cd_mask = torch.from_numpy(np.array(f['cd/mask'][global_idx]))          # (npix,)
+        # CD: float16 → float32 on read (model expects float32, bf16 conversion on GPU)
+        cd_stats = torch.from_numpy(np.array(f['cd_stats'][idx])).float()        # (npix, 4)
+        cd_time_bins = torch.from_numpy(np.array(f['cd_time_bins'][idx])).float() # (npix, 32)
 
-        # --- WP tokens: variable-length via offset index ---
-        wp_start, n_wp = self._wp_offsets[global_idx]
-        n_wp = int(n_wp)
-        wp_start = int(wp_start)
-
-        if n_wp > 0:
-            wp_flat = np.array(f['wp/tokens_flat'][wp_start:wp_start + n_wp * 5])
-            wp_tokens = torch.from_numpy(wp_flat.reshape(n_wp, 5))
-            wp_mask = torch.zeros(n_wp, dtype=torch.bool)
-            wp_unit_vecs = wp_tokens[:, :3]   # view, no copy
-            wp_times = wp_tokens[:, 4]         # view, no copy
+        # WP: cumulative offset → flat slice
+        s = int(self._wp_offsets[idx])
+        e = int(self._wp_offsets[idx + 1])
+        if e > s:
+            wp_tokens = torch.from_numpy(
+                np.array(f['wp_tokens_flat'][s * 5:e * 5])).float().reshape(-1, 5)
         else:
             wp_tokens = torch.zeros((0, 5), dtype=torch.float32)
-            wp_mask = torch.ones(0, dtype=torch.bool)
-            wp_unit_vecs = torch.zeros((0, 3), dtype=torch.float32)
-            wp_times = torch.zeros(0, dtype=torch.float32)
 
-        # --- Labels ---
-        u1 = torch.from_numpy(np.array(f['labels/u1'][global_idx]))
-        u2 = torch.from_numpy(np.array(f['labels/u2'][global_idx]))
-        p1 = torch.from_numpy(np.array(f['labels/p1'][global_idx]))
-        p2 = torch.from_numpy(np.array(f['labels/p2'][global_idx]))
+        # Labels: one read of 12 floats
+        labels = torch.from_numpy(np.array(f['labels'][idx])).float()  # (12,)
 
         return {
             'wp_tokens': wp_tokens,
-            'wp_mask': wp_mask,
-            'wp_unit_vecs': wp_unit_vecs,
-            'wp_times': wp_times,
-            'cd_unit_vecs': self._cd_unit_vecs,   # shared tensor
             'cd_stats': cd_stats,
             'cd_time_bins': cd_time_bins,
-            'cd_mask': cd_mask,
-            'cd_pixel_ids': self._cd_pixel_ids,   # cached constant
-            'u1': u1, 'u2': u2, 'p1': p1, 'p2': p2,
+            'labels': labels,
         }
 
     def __del__(self):
@@ -467,111 +410,99 @@ class PreprocessedDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Collate: minimal per-sample data → full batch dict for the model
+# ---------------------------------------------------------------------------
+
+def collate_fn(batch: list, cd_unit_vecs: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Assemble batch: pad WP, derive masks, add shared cd_unit_vecs."""
+    B = len(batch)
+    max_wp = max(b['wp_tokens'].shape[0] for b in batch)
+    npix = cd_unit_vecs.shape[0]
+
+    wp_tokens = torch.zeros(B, max_wp, 5)
+    wp_mask = torch.ones(B, max_wp, dtype=torch.bool)   # True = padding
+    cd_stats = torch.zeros(B, npix, 4)
+    cd_time_bins = torch.zeros(B, npix, 32)
+    labels = torch.zeros(B, 12)
+
+    for i, b in enumerate(batch):
+        n_wp = b['wp_tokens'].shape[0]
+        if n_wp > 0:
+            wp_tokens[i, :n_wp] = b['wp_tokens']
+            wp_mask[i, :n_wp] = False
+        cd_stats[i] = b['cd_stats']
+        cd_time_bins[i] = b['cd_time_bins']
+        labels[i] = b['labels']
+
+    # Derived fields (zero cost)
+    cd_mask = (cd_stats[:, :, 1] == 0)                                          # (B, npix)
+    cd_unit_vecs_batch = cd_unit_vecs.unsqueeze(0).expand(B, -1, -1).clone()    # (B, npix, 3)
+
+    return {
+        'wp_tokens': wp_tokens,
+        'wp_mask': wp_mask,
+        'wp_unit_vecs': wp_tokens[:, :, :3],    # view
+        'wp_times': wp_tokens[:, :, 4],          # view
+        'cd_unit_vecs': cd_unit_vecs_batch,
+        'cd_stats': cd_stats,
+        'cd_time_bins': cd_time_bins,
+        'cd_mask': cd_mask,
+        'u1': labels[:, :3],
+        'u2': labels[:, 3:6],
+        'p1': labels[:, 6:9],
+        'p2': labels[:, 9:12],
+    }
+
+
+# ---------------------------------------------------------------------------
 # DataLoader factory
 # ---------------------------------------------------------------------------
 
 def create_preprocessed_dataloaders(
     config: dict, preprocessed_dir: str
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Create DataLoaders from preprocessed HDF5 data."""
+    """Create thin DataLoaders from split-level HDF5 files."""
     data_cfg = config['data']
     train_cfg = config['train']
 
-    # Load manifest
-    manifest_path = os.path.join(preprocessed_dir, 'manifest.json')
-    with open(manifest_path, 'r') as f:
-        manifest = json.load(f)
+    # Load metadata
+    with open(os.path.join(preprocessed_dir, 'meta.json'), 'r') as f:
+        meta = json.load(f)
 
-    # Check format
-    cd_repr = manifest.get('cd_representation', 'active_patch')
-    if cd_repr != 'dense_healpix':
-        raise RuntimeError(
-            f"Preprocessed cache is '{cd_repr}' format, "
-            f"but Stage B model requires 'dense_healpix'. "
-            f"Please delete {preprocessed_dir} and re-run preprocessing."
-        )
+    if meta.get('cd_representation') != 'dense_healpix':
+        raise RuntimeError("Old format detected. Please delete and re-run --Preprocess.")
 
-    # Detect HDF5 vs old .pt format
-    fmt = manifest.get('format', 'pt')
-    h5_path = os.path.join(preprocessed_dir, 'data.h5')
+    # Shared geometry
+    cd_unit_vecs_path = os.path.join(preprocessed_dir, 'cd_unit_vecs.npy')
+    cd_unit_vecs = torch.from_numpy(np.load(cd_unit_vecs_path))  # (npix, 3) float32
 
-    if fmt == 'hdf5' and os.path.exists(h5_path):
-        return _create_hdf5_dataloaders(config, h5_path, manifest)
-    else:
-        if any(fn.startswith('batch_') and fn.endswith('.pt')
-               for fn in os.listdir(preprocessed_dir)):
-            raise RuntimeError(
-                "Old .pt format detected. Please re-run preprocessing: "
-                f"rm -rf {preprocessed_dir} && python -m cli.run --config configs/default.yaml --Preprocess"
-            )
-        raise FileNotFoundError(f"No preprocessed data found in {preprocessed_dir}")
-
-
-def _create_hdf5_dataloaders(
-    config: dict, h5_path: str, manifest: dict
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Create DataLoaders backed by HDF5 chunked storage."""
-    data_cfg = config['data']
-    train_cfg = config['train']
-
-    original_count = manifest.get('original_events', manifest['total_events'])
-    expand_times = manifest.get('expand_times', 0)
-    total_events = manifest['total_events']
-    logger.info(f"Preprocessed HDF5 data: {total_events} events from {h5_path} "
-                f"(original={original_count}, expand_times={expand_times})")
-
-    # Split only the ORIGINAL event indices, then expand each split
-    ratios = [data_cfg['train_ratio'], data_cfg['val_ratio'], data_cfg['test_ratio']]
-    orig_indices = np.arange(original_count)
-    np.random.seed(train_cfg.get('seed', 42))
-    np.random.shuffle(orig_indices)
-
-    n_train = int(ratios[0] * original_count)
-    n_val = int(ratios[1] * original_count)
-
-    train_orig = orig_indices[:n_train]
-    val_orig = orig_indices[n_train:n_train + n_val]
-    test_orig = orig_indices[n_train + n_val:]
-
-    # Expand indices: each split gets its original events + all rotated copies
-    def _expand_split(orig_idx, original_count, expand_times):
-        result = orig_idx.tolist()
-        for exp in range(expand_times):
-            offset = original_count * (exp + 1)
-            result.extend((orig_idx + offset).tolist())
-        return np.array(result, dtype=np.int64)
-
-    train_idx = _expand_split(train_orig, original_count, expand_times)
-    val_idx = _expand_split(val_orig, original_count, expand_times)
-    test_idx = _expand_split(test_orig, original_count, expand_times)
-
-    logger.info(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+    logger.info(f"Split HDF5 data: train={meta['train_events']}, "
+                f"val={meta['val_events']}, test={meta['test_events']}")
 
     batch_size = train_cfg['batch_size']
     val_batch_size = train_cfg.get('val_batch_size', -1)
     if val_batch_size <= 0:
         val_batch_size = batch_size
 
-    cache_nbytes = data_cfg.get('h5_cache_nbytes', 256 * 1024 * 1024)
-
-    train_ds = PreprocessedDataset(h5_path, train_idx, cache_nbytes=cache_nbytes)
-    val_ds = PreprocessedDataset(h5_path, val_idx, cache_nbytes=cache_nbytes)
-    test_ds = PreprocessedDataset(h5_path, test_idx, cache_nbytes=cache_nbytes)
-
-    # HDF5 path with lazy-open: safe to use num_workers > 0
-    num_workers = data_cfg.get('num_workers', 4)
+    num_workers = data_cfg.get('num_workers', 8)
     prefetch = data_cfg.get('prefetch_factor', 2) if num_workers > 0 else None
 
+    train_ds = SplitDataset(os.path.join(preprocessed_dir, 'train.h5'))
+    val_ds = SplitDataset(os.path.join(preprocessed_dir, 'val.h5'))
+    test_ds = SplitDataset(os.path.join(preprocessed_dir, 'test.h5'))
+
+    _collate = functools.partial(collate_fn, cd_unit_vecs=cd_unit_vecs)
+
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=num_workers,
+                              collate_fn=_collate, num_workers=num_workers,
                               pin_memory=True, persistent_workers=num_workers > 0,
                               prefetch_factor=prefetch)
     val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=num_workers,
+                            collate_fn=_collate, num_workers=num_workers,
                             pin_memory=True, persistent_workers=num_workers > 0,
                             prefetch_factor=prefetch)
     test_loader = DataLoader(test_ds, batch_size=val_batch_size, shuffle=False,
-                             collate_fn=collate_fn, num_workers=num_workers,
+                             collate_fn=_collate, num_workers=num_workers,
                              pin_memory=True, persistent_workers=num_workers > 0,
                              prefetch_factor=prefetch)
 
