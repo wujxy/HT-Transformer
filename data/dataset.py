@@ -430,30 +430,25 @@ class H5EndpointDataset(Dataset):
 
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
-    Custom collate: pad variable-length WP and CD tokens to batch max.
+    Custom collate: pad variable-length WP tokens to batch max.
+    CD uses fixed dense HEALPix grid — no padding needed, just stack.
     """
-    # Stage B: CD uses fixed dense HEALPix grid, so no padding needed for CD
-    # Only WP needs padding due to variable hit counts
     max_wp = max(b['wp_tokens'].shape[0] for b in batch)
     B = len(batch)
     npix = batch[0]['cd_unit_vecs'].shape[0]  # Fixed: 12 * nside^2
     num_time_bins = batch[0]['cd_time_bins'].shape[1] if batch[0]['cd_time_bins'].dim() > 1 else 0
 
-    # Allocate tensors
     # WP: variable length, needs padding
     wp_tokens = torch.zeros(B, max_wp, 5)
     wp_mask = torch.ones(B, max_wp, dtype=torch.bool)  # True = padding
     wp_unit_vecs = torch.zeros(B, max_wp, 3)
     wp_times = torch.zeros(B, max_wp)
 
-    # Stage B: CD fixed shape (npix, ...), no padding needed, just stack
-    cd_unit_vecs = torch.zeros(B, npix, 3)
+    # CD: fixed shape, just stack. cd_unit_vecs is shared across all events.
+    cd_unit_vecs = batch[0]['cd_unit_vecs'].unsqueeze(0).expand(B, -1, -1).clone()
     cd_stats = torch.zeros(B, npix, 4)
     cd_time_bins = torch.zeros(B, npix, num_time_bins)
-    cd_mask = torch.ones(B, npix, dtype=torch.bool)   # True = inactive/no hits
-    cd_times_mean = torch.zeros(B, npix)
-    # DEPRECATED in Stage B: kept for compatibility
-    cd_pixel_ids = torch.arange(npix, dtype=torch.long).unsqueeze(0).repeat(B, 1)
+    cd_mask = torch.ones(B, npix, dtype=torch.bool)
 
     u1 = torch.zeros(B, 3)
     u2 = torch.zeros(B, 3)
@@ -469,20 +464,16 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             wp_unit_vecs[i, :n_wp] = b['wp_unit_vecs']
             wp_times[i, :n_wp] = b['wp_times']
 
-        # Stage B: CD fixed shape, direct copy
-        cd_unit_vecs[i] = b['cd_unit_vecs']
         cd_stats[i] = b['cd_stats']
         cd_time_bins[i] = b['cd_time_bins']
-        cd_mask[i] = b['cd_mask']  # Use the event's cd_mask (True = inactive)
-        cd_times_mean[i] = b['cd_times_mean']
-        # cd_pixel_ids[i] = b['cd_pixel_ids']  # Now fixed [0, 1, ..., npix-1]
+        cd_mask[i] = b['cd_mask']
 
         u1[i] = b['u1']
         u2[i] = b['u2']
         p1[i] = b['p1']
         p2[i] = b['p2']
 
-    result = {
+    return {
         'wp_tokens': wp_tokens,
         'wp_mask': wp_mask,
         'wp_unit_vecs': wp_unit_vecs,
@@ -491,15 +482,11 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         'cd_stats': cd_stats,
         'cd_time_bins': cd_time_bins,
         'cd_mask': cd_mask,
-        'cd_times_mean': cd_times_mean,
-        'cd_pixel_ids': cd_pixel_ids,
         'u1': u1,
         'u2': u2,
         'p1': p1,
         'p2': p2,
     }
-
-    return result
 
 
 def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,

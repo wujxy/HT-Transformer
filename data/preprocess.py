@@ -11,7 +11,6 @@ Training will auto-detect the preprocessed data and skip tokenization.
 
 Storage layout (data.h5):
     /metadata/cd_unit_vecs  (npix, 3)     shared across all events
-    /metadata/cd_pixel_ids  (npix,)        shared
     /cd/stats               (N, npix, 4)   chunked per event
     /cd/time_bins           (N, npix, 32)  chunked per event, gzip
     /cd/mask                (N, npix)      chunked per event
@@ -60,15 +59,7 @@ def _config_hash(config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins):
-    """Write a list of tokenized event dicts into an HDF5 file.
-
-    Args:
-        h5f: open h5py.File (write mode)
-        tokenized_events: list of dicts from H5EndpointDataset.__getitem__
-        start_idx: global event index to start writing at
-        npix: number of HEALPix pixels
-        num_time_bins: number of CD time bins
-    """
+    """Write a list of tokenized event dicts into an HDF5 file."""
     n = len(tokenized_events)
     end_idx = start_idx + n
 
@@ -83,10 +74,9 @@ def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins)
 
     wp_flat_parts = []
     wp_offsets = np.zeros((n, 2), dtype=np.int64)
-    wp_flat_offset = int(h5f['wp/tokens_flat'].shape[0]) if 'wp/tokens_flat' in h5f else 0
 
     for i, ev in enumerate(tokenized_events):
-        # CD data (numpy)
+        # CD data
         cd_stats[i] = ev['cd_stats'].numpy() if isinstance(ev['cd_stats'], torch.Tensor) else ev['cd_stats']
         cd_time_bins[i] = ev['cd_time_bins'].numpy() if isinstance(ev['cd_time_bins'], torch.Tensor) else ev['cd_time_bins']
         cd_mask[i] = ev['cd_mask'].numpy() if isinstance(ev['cd_mask'], torch.Tensor) else ev['cd_mask']
@@ -100,13 +90,13 @@ def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins)
         wp_tok = ev['wp_tokens']
         wp_tok_np = wp_tok.numpy() if isinstance(wp_tok, torch.Tensor) else wp_tok
         n_wp = wp_tok_np.shape[0]
-        wp_offsets[i] = [wp_flat_offset // 5 if wp_tok_np.shape[-1] == 5 else wp_flat_offset, n_wp]
 
         if n_wp > 0:
             flat = wp_tok_np.reshape(-1).astype(np.float32)
             wp_flat_parts.append(flat)
-            wp_flat_offset += flat.size
-        # else: offset stays, n_wp = 0
+            wp_offsets[i] = [0, n_wp]  # will be fixed below
+        else:
+            wp_offsets[i] = [0, 0]
 
     # Batch write fixed-shape datasets
     h5f['cd/stats'][start_idx:end_idx] = cd_stats
@@ -117,14 +107,14 @@ def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins)
     h5f['labels/p1'][start_idx:end_idx] = p1
     h5f['labels/p2'][start_idx:end_idx] = p2
 
-    # Append WP flat tokens and write offsets
+    # Append WP flat tokens and compute correct offsets
     if wp_flat_parts:
         all_flat = np.concatenate(wp_flat_parts)
         old_size = h5f['wp/tokens_flat'].shape[0]
         h5f['wp/tokens_flat'].resize(old_size + all_flat.size, axis=0)
         h5f['wp/tokens_flat'][old_size:old_size + all_flat.size] = all_flat
 
-    # Recompute WP offsets based on actual flat position
+    # Fix offsets to point into the flat array
     wp_offset_pos = 0
     for i, ev in enumerate(tokenized_events):
         wp_tok = ev['wp_tokens']
@@ -141,7 +131,6 @@ def _write_events_to_hdf5(h5f, tokenized_events, start_idx, npix, num_time_bins)
 
 def _create_hdf5_datasets(h5f, total_events, npix, num_time_bins):
     """Create HDF5 dataset placeholders for all fields."""
-    # Metadata (shared, written once)
     g_meta = h5f.create_group('metadata')
 
     # CD fixed-shape datasets: chunked per event for O(1) random access
@@ -163,7 +152,7 @@ def _create_hdf5_datasets(h5f, total_events, npix, num_time_bins):
     g_wp = h5f.create_group('wp')
     g_wp.create_dataset(
         'tokens_flat', shape=(0,), dtype='float32',
-        maxshape=(None,), chunks=(1024 * 1024,),  # 1M float32 chunks
+        maxshape=(None,), chunks=(1024 * 1024,),
     )
     g_wp.create_dataset(
         'offsets', shape=(total_events, 2), dtype='int64',
@@ -254,7 +243,6 @@ def preprocess(config: dict):
     if max_events > 0 and max_events < total_events:
         logger.info(f"Limiting to {max_events} events (out of {total_events})")
         total_events = max_events
-        # Truncate events_per_file to match the limited total
         truncated = []
         remaining = max_events
         for n in events_per_file:
@@ -279,7 +267,6 @@ def preprocess(config: dict):
     expand_times = config.get('augmentation', {}).get('rotation_expand_times', 0)
     total_with_aug = total_events * (1 + expand_times)
 
-    # Create HDF5 file with pre-allocated datasets
     logger.info(f"Creating HDF5 file: {h5_path} ({total_with_aug} events)")
     with h5py.File(h5_path, 'w') as h5f:
         _create_hdf5_datasets(h5f, total_with_aug, npix, num_time_bins)
@@ -287,8 +274,6 @@ def preprocess(config: dict):
         # Write shared metadata
         h5f['metadata'].create_dataset(
             'cd_unit_vecs', data=healpix.cd_unit_vecs.astype(np.float32))
-        h5f['metadata'].create_dataset(
-            'cd_pixel_ids', data=np.arange(npix, dtype=np.int64))
         h5f['metadata'].attrs['nside'] = data_cfg['nside']
         h5f['metadata'].attrs['npix'] = npix
         h5f['metadata'].attrs['num_time_bins'] = num_time_bins
@@ -378,8 +363,8 @@ class PreprocessedDataset(Dataset):
     """
     Dataset that reads pre-tokenized events from HDF5 chunked storage.
 
-    Each __getitem__ reads exactly one HDF5 chunk per field (~132 KB total),
-    instead of loading an entire .pt batch file (~83 MB).
+    Uses lazy file open: each worker process opens its own h5py.File handle
+    on first __getitem__ call, avoiding fork-safety issues with h5py.
 
     Memory usage is bounded by the HDF5 chunk cache (rdcc_nbytes, default 256 MB).
     """
@@ -393,18 +378,21 @@ class PreprocessedDataset(Dataset):
             cache_nbytes: max HDF5 chunk cache size in bytes (default 256 MB)
         """
         self._h5_path = h5_path
-        self._file = h5py.File(h5_path, 'r', rdcc_nbytes=cache_nbytes, rdcc_w0=0.5)
+        self._cache_nbytes = cache_nbytes
 
-        # Load shared metadata once (tiny, ~9 KB)
-        self._cd_unit_vecs = torch.from_numpy(
-            np.array(self._file['metadata/cd_unit_vecs']))  # (npix, 3)
-        self._npix = self._file['metadata'].attrs['npix']
+        # Lazy-open: file handle created per-worker in _ensure_open()
+        self._file = None
 
-        # WP offset index (tiny, ~3.8 MB for 240K events)
-        self._wp_offsets = self._file['wp/offsets'][:]  # (N, 2) int64
+        # Read metadata from file (open briefly, then close)
+        with h5py.File(h5_path, 'r') as f:
+            self._cd_unit_vecs = torch.from_numpy(
+                np.array(f['metadata/cd_unit_vecs']))  # (npix, 3), ~9 KB
+            self._npix = int(f['metadata'].attrs['npix'])
+            self._wp_offsets = f['wp/offsets'][:]       # (N, 2) int64, ~3.8 MB
+            self._total_events = f['cd/stats'].shape[0]
 
-        # Total events
-        self._total_events = self._file['cd/stats'].shape[0]
+        # Cached constant tensors
+        self._cd_pixel_ids = torch.arange(self._npix, dtype=torch.long)
 
         # Apply indices
         if indices is not None:
@@ -412,10 +400,20 @@ class PreprocessedDataset(Dataset):
         else:
             self._indices = np.arange(self._total_events)
 
+    def _ensure_open(self):
+        """Open HDF5 file handle lazily (per-worker, fork-safe)."""
+        if self._file is None:
+            self._file = h5py.File(
+                self._h5_path, 'r',
+                rdcc_nbytes=self._cache_nbytes, rdcc_w0=0.5,
+            )
+
     def __len__(self) -> int:
         return len(self._indices)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        self._ensure_open()
+
         global_idx = int(self._indices[idx])
         f = self._file
 
@@ -452,14 +450,11 @@ class PreprocessedDataset(Dataset):
             'wp_mask': wp_mask,
             'wp_unit_vecs': wp_unit_vecs,
             'wp_times': wp_times,
-            # CD: shared unit vecs + per-event data
-            'cd_unit_vecs': self._cd_unit_vecs,    # shared tensor, no per-event storage
+            'cd_unit_vecs': self._cd_unit_vecs,   # shared tensor
             'cd_stats': cd_stats,
             'cd_time_bins': cd_time_bins,
             'cd_mask': cd_mask,
-            'cd_times_mean': cd_stats[:, 3],       # derived view
-            'cd_pixel_ids': torch.arange(self._npix, dtype=torch.long),  # generated
-            # Labels
+            'cd_pixel_ids': self._cd_pixel_ids,   # cached constant
             'u1': u1, 'u2': u2, 'p1': p1, 'p2': p2,
         }
 
@@ -503,14 +498,8 @@ def create_preprocessed_dataloaders(
     if fmt == 'hdf5' and os.path.exists(h5_path):
         return _create_hdf5_dataloaders(config, h5_path, manifest)
     else:
-        # Old .pt format — prompt user to re-preprocess
         if any(fn.startswith('batch_') and fn.endswith('.pt')
                for fn in os.listdir(preprocessed_dir)):
-            logger.warning(
-                "Found old .pt format preprocessed data. "
-                "Please delete the preprocessed directory and re-run --Preprocess "
-                "to generate the new HDF5 format for better performance."
-            )
             raise RuntimeError(
                 "Old .pt format detected. Please re-run preprocessing: "
                 f"rm -rf {preprocessed_dir} && python -m cli.run --config configs/default.yaml --Preprocess"
@@ -559,30 +548,29 @@ def _create_hdf5_dataloaders(
     logger.info(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     batch_size = train_cfg['batch_size']
+    val_batch_size = train_cfg.get('val_batch_size', -1)
+    if val_batch_size <= 0:
+        val_batch_size = batch_size
+
     cache_nbytes = data_cfg.get('h5_cache_nbytes', 256 * 1024 * 1024)
 
     train_ds = PreprocessedDataset(h5_path, train_idx, cache_nbytes=cache_nbytes)
     val_ds = PreprocessedDataset(h5_path, val_idx, cache_nbytes=cache_nbytes)
     test_ds = PreprocessedDataset(h5_path, test_idx, cache_nbytes=cache_nbytes)
 
-    # DataLoader config: disable num_workers when using accelerate
-    use_accelerate = train_cfg.get('use_accelerate', False)
-    if use_accelerate:
-        num_workers = 0
-        prefetch = None
-    else:
-        num_workers = data_cfg.get('num_workers', 4)
-        prefetch = data_cfg.get('prefetch_factor', 2) if num_workers > 0 else None
+    # HDF5 path with lazy-open: safe to use num_workers > 0
+    num_workers = data_cfg.get('num_workers', 4)
+    prefetch = data_cfg.get('prefetch_factor', 2) if num_workers > 0 else None
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               collate_fn=collate_fn, num_workers=num_workers,
                               pin_memory=True, persistent_workers=num_workers > 0,
                               prefetch_factor=prefetch)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+    val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False,
                             collate_fn=collate_fn, num_workers=num_workers,
                             pin_memory=True, persistent_workers=num_workers > 0,
                             prefetch_factor=prefetch)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=val_batch_size, shuffle=False,
                              collate_fn=collate_fn, num_workers=num_workers,
                              pin_memory=True, persistent_workers=num_workers > 0,
                              prefetch_factor=prefetch)

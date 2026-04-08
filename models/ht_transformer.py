@@ -371,7 +371,6 @@ class HTTransformer(nn.Module):
         query_emb = query_emb + self.type_embedding(query_type)
 
         # DeepSphere encoding + Compression (Stage B: fixed graph, no runtime construction)
-        cd_pixel_ids = batch.get('cd_pixel_ids', None)
         cd_mask_input = batch.get('cd_mask', None)
 
         # CD encoder: works on fixed HEALPix grid with precomputed kNN adjacency
