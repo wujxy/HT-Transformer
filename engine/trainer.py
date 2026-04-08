@@ -373,35 +373,21 @@ class Trainer:
         def count_params(module):
             return sum(p.numel() for p in module.parameters())
 
-        # V2 architecture components
+        # V3 architecture components
+        wp_layers_params = count_params(m.wp_layers) if hasattr(m, 'wp_layers') else 0
+        cd_cond_params = count_params(m.cd_conditioning) if hasattr(m, 'cd_conditioning') else 0
+        readout_params = count_params(m.readout) if hasattr(m, 'readout') else 0
         components = [
             ("WP Projector      ", count_params(m.wp_projector)),
             ("CD Projector      ", count_params(m.cd_projector)),
             ("CD Encoder (DeepSphere)", count_params(m.cd_encoder) if hasattr(m, 'cd_encoder') else 0),
             ("CD Compression    ", count_params(m.cd_compression) if hasattr(m, 'cd_compression') else 0),
-            ("WP Time Bias      ", count_params(m.wp_time_bias) if hasattr(m, 'wp_time_bias') and m.wp_time_bias is not None else 0),
+            ("WP Time Encoding  ", count_params(m.wp_time_encoding) if hasattr(m, 'wp_time_encoding') and m.wp_time_encoding is not None else 0),
             ("Type Embedding    ", count_params(m.type_embedding)),
             ("Position Encoding ", count_params(m.abs_pe)),
-            ("Fusion Layers     ", count_params(m.encoder_layers)),
-            ("  - Attention     ", sum(
-                count_params(getattr(layer, name))
-                for layer in m.encoder_layers
-                for name in ['wp_self_attn', 'wp_cd_cross',
-                             'cd_wp_cross', 'global_attn', 'query_attn']
-            )),
-            ("  - FFN           ", sum(
-                count_params(getattr(layer, name))
-                for layer in m.encoder_layers
-                for name in ['wp_ffn', 'cd_ffn', 'global_ffn', 'query_ffn']
-            )),
-            ("  - LayerNorm     ", sum(
-                count_params(getattr(layer, name))
-                for layer in m.encoder_layers
-                for name in ['wp_attn_norm', 'wp_cross_norm',
-                             'cd_cross_norm', 'global_norm', 'query_norm',
-                             'wp_ffn_norm', 'cd_ffn_norm', 'global_ffn_norm',
-                             'query_ffn_norm']
-            )),
+            ("WP Layers         ", wp_layers_params),
+            ("CD Conditioning   ", cd_cond_params),
+            ("CrossModal Readout", readout_params),
             ("Output Heads      ", count_params(m.head1) + count_params(m.head2)),
             ("Learnable Tokens  ", count_params(nn.ParameterList([m.global_tokens, m.query_tokens]))),
         ]

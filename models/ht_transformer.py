@@ -1,23 +1,23 @@
 """
-Hybrid Token Transformer for JUNO Ordered Dual-Endpoint Reconstruction (V2).
+Hybrid Token Transformer for JUNO Ordered Dual-Endpoint Reconstruction (V3).
 
 Architecture:
   WP hits (hit-level) + CD patches (HEALPix) + Global tokens + Query tokens
-  → Hybrid Encoder with structured attention
-  → 2 Query outputs → Endpoint Heads → ordered unit vectors
+  → WP backbone (self-attention) + CD auxiliary (DeepSphere + conditioning)
+  → Cross-modal readout → 2 Query outputs → Endpoint Heads → ordered unit vectors
 
-V2 Features:
+V3 Architecture (WP-backbone + CD-auxiliary):
+  - WP processes independently through self-attention layers (backbone)
+  - CD processes independently through DeepSphere + compression
+  - Single-direction WP→CD conditioning: CD reads WP for trajectory context
+  - Final readout: Query/Global read from [WP, CD] (no bidirectional update)
+  - Information flows WP → CD → Query (never CD → WP)
+
+V2 Features (preserved):
   - WPProjector: dual-branch [ux,uy,uz]⊕[q,t] feature extraction
   - DeepSphereEncoder: local spherical aggregation for CD
   - CDCompression: HEALPix hierarchical pooling
-  - SignedTimeBucketBias: WP time-aware self-attention
-
-Attention rules:
-  WP↔WP: dense with signed time bias
-  WP↔CD: dense cross-attention (bidirectional)
-  CD↔CD: DeepSphere local aggregation (NOT full attention)
-  Global↔All: dense
-  Query↔All: dense cross-attention
+  - WPTimeEncoding: token-level time encoding (SDPA-compatible)
 """
 
 import torch
@@ -206,6 +206,134 @@ class HybridFusionLayer(nn.Module):
         return wp_out, cd_out, global_out, query_out
 
 
+class WPSelfAttentionLayer(nn.Module):
+    """WP backbone layer: only WP self-attention + FFN.
+
+    In the V3 architecture, WP processes independently as the main information
+    source. CD never modifies WP representations.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 dropout: float = 0.1, norm_type: str = 'layernorm'):
+        super().__init__()
+        NormClass = RMSNorm if norm_type == 'rmsnorm' else nn.LayerNorm
+        self.wp_self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.wp_attn_norm = NormClass(d_model)
+        self.wp_ffn = FeedForward(d_model, d_ff, dropout)
+        self.wp_ffn_norm = NormClass(d_model)
+
+    def forward(self, wp_emb: torch.Tensor, wp_attn_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            wp_emb: (B, N_wp, D)
+            wp_attn_mask: (B, N_wp, N_wp) boolean mask
+
+        Returns:
+            (B, N_wp, D)
+        """
+        # Pre-LN WP self-attn
+        wp_normed = self.wp_attn_norm(wp_emb)
+        wp_out = wp_emb + self.wp_self_attn(wp_normed, wp_normed, wp_normed,
+                                             mask=wp_attn_mask)
+        # FFN
+        wp_out = wp_out + self.wp_ffn(self.wp_ffn_norm(wp_out))
+        return wp_out
+
+
+class CDConditioningLayer(nn.Module):
+    """Single-direction WP→CD conditioning.
+
+    CD reads from WP to obtain trajectory context, allowing CD to focus on
+    the response pattern relevant to this specific track. This is a one-way
+    information flow: WP is not modified.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 dropout: float = 0.1, norm_type: str = 'layernorm'):
+        super().__init__()
+        NormClass = RMSNorm if norm_type == 'rmsnorm' else nn.LayerNorm
+        self.cd_cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.cd_cross_norm = NormClass(d_model)
+        self.cd_ffn = FeedForward(d_model, d_ff, dropout)
+        self.cd_ffn_norm = NormClass(d_model)
+
+    def forward(self, cd_emb: torch.Tensor, wp_emb: torch.Tensor,
+                cd_cross_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cd_emb: (B, N_cd, D) CD embeddings (query)
+            wp_emb: (B, N_wp, D) WP embeddings (key/value, not modified)
+            cd_cross_mask: (B, N_cd, N_wp) boolean mask for CD→WP cross-attn
+
+        Returns:
+            (B, N_cd, D) conditioned CD embeddings
+        """
+        # CD queries WP for trajectory context
+        cd_normed = self.cd_cross_norm(cd_emb)
+        cd_out = cd_emb + self.cd_cross_attn(cd_normed, wp_emb, wp_emb,
+                                              mask=cd_cross_mask)
+        # FFN
+        cd_out = cd_out + self.cd_ffn(self.cd_ffn_norm(cd_out))
+        return cd_out
+
+
+class CrossModalReadout(nn.Module):
+    """Final readout: queries and global tokens attend to [WP, CD].
+
+    No bidirectional update — only Query/Global read from WP and CD.
+    This is the only point where CD information enters the prediction path.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 num_global: int, num_queries: int,
+                 dropout: float = 0.1, norm_type: str = 'layernorm'):
+        super().__init__()
+        NormClass = RMSNorm if norm_type == 'rmsnorm' else nn.LayerNorm
+        # Global→[WP, CD]: global summarizes both modalities
+        self.global_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.global_norm = NormClass(d_model)
+        # Query→[WP, CD, Global]: queries read everything
+        self.query_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.query_norm = NormClass(d_model)
+        # FFN
+        self.global_ffn = FeedForward(d_model, d_ff, dropout)
+        self.global_ffn_norm = NormClass(d_model)
+        self.query_ffn = FeedForward(d_model, d_ff, dropout)
+        self.query_ffn_norm = NormClass(d_model)
+
+    def forward(self, wp_emb: torch.Tensor, cd_emb: torch.Tensor,
+                global_emb: torch.Tensor, query_emb: torch.Tensor,
+                mask_pack: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            wp_emb: (B, N_wp, D) WP embeddings (read-only)
+            cd_emb: (B, N_cd, D) CD embeddings (read-only)
+            global_emb: (B, M, D) global tokens
+            query_emb: (B, Q, D) query tokens
+            mask_pack: dict with 'global' and 'query' masks
+
+        Returns:
+            (global_out, query_out): updated global and query embeddings
+        """
+        # Global attends to [WP, CD]
+        all_tokens = torch.cat([wp_emb, cd_emb], dim=1)
+        global_normed = self.global_norm(global_emb)
+        global_out = global_emb + self.global_attn(global_normed, all_tokens, all_tokens,
+                                                    mask=mask_pack['global'])
+
+        # Query attends to [WP, CD, Global]
+        all_with_global = torch.cat([wp_emb, cd_emb, global_out], dim=1)
+        query_normed = self.query_norm(query_emb)
+        query_out = query_emb + self.query_attn(query_normed, all_with_global, all_with_global,
+                                                 mask=mask_pack['query'])
+
+        # FFN
+        global_out = global_out + self.global_ffn(self.global_ffn_norm(global_out))
+        query_out = query_out + self.query_ffn(self.query_ffn_norm(query_out))
+
+        return global_out, query_out
+
+
 def _masked_mean(emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean over dim=1 ignoring padded positions."""
     valid = (~mask).float().unsqueeze(-1)
@@ -308,19 +436,38 @@ class HTTransformer(nn.Module):
         except:
             self.cd_knn_adj = None
 
-        # Fusion encoder layers
-        self.encoder_layers = nn.ModuleList([
-            HybridFusionLayer(
+        # Fusion encoder layers (V3: asymmetric WP-backbone + CD-auxiliary)
+        # WP backbone: independent self-attention layers
+        self.wp_layers = nn.ModuleList([
+            WPSelfAttentionLayer(
                 d_model=self.d_model,
                 num_heads=model_cfg['num_heads'],
                 d_ff=model_cfg['d_ff'],
-                num_global=self.num_global,
-                num_queries=self.num_queries,
                 dropout=model_cfg.get('dropout', 0.1),
                 norm_type=self.norm_type,
             )
             for _ in range(self.num_layers)
         ])
+
+        # CD conditioning: single-direction WP→CD cross-attention
+        self.cd_conditioning = CDConditioningLayer(
+            d_model=self.d_model,
+            num_heads=model_cfg['num_heads'],
+            d_ff=model_cfg['d_ff'],
+            dropout=model_cfg.get('dropout', 0.1),
+            norm_type=self.norm_type,
+        )
+
+        # Cross-modal readout: Query/Global read from [WP, CD]
+        self.readout = CrossModalReadout(
+            d_model=self.d_model,
+            num_heads=model_cfg['num_heads'],
+            d_ff=model_cfg['d_ff'],
+            num_global=self.num_global,
+            num_queries=self.num_queries,
+            dropout=model_cfg.get('dropout', 0.1),
+            norm_type=self.norm_type,
+        )
 
         # Output heads
         self.head1 = EndpointHead(self.d_model, dropout=model_cfg.get('dropout', 0.1))
@@ -336,10 +483,10 @@ class HTTransformer(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         B = batch['wp_tokens'].shape[0]
 
-        # Project tokens
+        # ── Token projection (unchanged) ──
         wp_emb = self.wp_projector(batch['wp_tokens'])
 
-        # Add token-level time encoding (SDPA-compatible, replaces pairwise time bias)
+        # Add token-level time encoding (SDPA-compatible)
         if self.wp_time_encoding is not None:
             wp_times = batch.get('wp_times', None)
             if wp_times is not None:
@@ -370,7 +517,7 @@ class HTTransformer(nn.Module):
         global_emb = global_emb + self.type_embedding(global_type)
         query_emb = query_emb + self.type_embedding(query_type)
 
-        # DeepSphere encoding + Compression (Stage B: fixed graph, no runtime construction)
+        # ── CD independent encoding (unchanged) ──
         cd_mask_input = batch.get('cd_mask', None)
 
         # CD encoder: works on fixed HEALPix grid with precomputed kNN adjacency
@@ -381,52 +528,39 @@ class HTTransformer(nn.Module):
         )
 
         # CD compression: fixed dense grid -> fixed low-res grid
-        # Stage B: simplified interface, no pixel_ids needed
         cd_emb, cd_mask = self.cd_compression(cd_emb, mask=cd_mask_input)
 
-        # Precompute attention masks outside layer loop (optimization)
-        # These masks don't change between layers, so compute once here
-        N_wp = wp_emb.shape[1]
-        N_cd = cd_emb.shape[1]
-        M = self.num_global
-        Q = self.num_queries
-
+        # ── WP independent encoding (V3: WP backbone, no CD interaction) ──
         wp_mask = batch['wp_mask']
-
-        # WP self-attention mask
         wp_attn_mask = wp_mask.unsqueeze(1) | wp_mask.unsqueeze(2)
 
-        # WP->CD cross-attention mask
-        wp_cross_mask = cd_mask.unsqueeze(1).expand(-1, N_wp, -1)
+        for wp_layer in self.wp_layers:
+            wp_emb = wp_layer(wp_emb, wp_attn_mask)
 
-        # CD->WP cross-attention mask
-        cd_cross_mask = wp_mask.unsqueeze(1).expand(-1, N_cd, -1)
+        # ── CD conditioning: WP→CD single-direction injection ──
+        # CD reads from WP to obtain trajectory context
+        N_wp = wp_emb.shape[1]
+        N_cd = cd_emb.shape[1]
+        cd_cross_mask = wp_mask.unsqueeze(1).expand(-1, N_cd, -1)  # (B, N_cd, N_wp)
+        cd_emb = self.cd_conditioning(cd_emb, wp_emb, cd_cross_mask)
 
-        # Global attention mask (attends to WP + CD)
+        # ── Late readout: Query/Global read from [WP, CD] ──
+        M = self.num_global
+        Q = self.num_queries
         all_mask = torch.cat([wp_mask, cd_mask], dim=1)
         global_attn_mask = all_mask.unsqueeze(1).expand(-1, M, -1)
-
-        # Query attention mask (attends to WP + CD + Global)
         all_global_mask = torch.cat([wp_mask, cd_mask,
                                       torch.zeros(B, M, dtype=torch.bool, device=wp_mask.device)], dim=1)
         query_attn_mask = all_global_mask.unsqueeze(1).expand(-1, Q, -1)
 
-        mask_pack = {
-            'wp_attn': wp_attn_mask,
-            'wp_cross': wp_cross_mask,
-            'cd_cross': cd_cross_mask,
+        readout_mask_pack = {
             'global': global_attn_mask,
             'query': query_attn_mask,
         }
 
-        # Encoder layers (all use SDPA-compatible attention)
-        for layer in self.encoder_layers:
-            wp_emb, cd_emb, global_emb, query_emb = layer(
-                wp_emb, cd_emb, global_emb, query_emb,
-                mask_pack=mask_pack,
-            )
+        global_emb, query_emb = self.readout(wp_emb, cd_emb, global_emb, query_emb, readout_mask_pack)
 
-        # Output heads
+        # ── Output heads (with pooling shortcut) ──
         global_context = global_emb.mean(dim=1)
         global_context = global_context + _masked_mean(wp_emb, batch['wp_mask'])
         global_context = global_context + _masked_mean(cd_emb, cd_mask)

@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v2_test"
+mission_name: "ht_transformer_v3"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -58,7 +58,7 @@ model:
   # wp_time_bias_heads_shared: true     # DEPRECATED
   # wp_time_bias_layers: 1               # DEPRECATED
   # CD DeepSphere
-  cd_deepsphere_layers: 4
+  cd_deepsphere_layers: 2
   cd_deepsphere_hidden: 256
   cd_compression: "healpix_pool"
   cd_fusion_tokens: 128
@@ -88,7 +88,7 @@ train:
   dropout: 0.1
   grad_clip: 1.0
   batch_size: 64
-  num_epochs: 5
+  num_epochs: 100
   save_every: 50
   eval_every: 5
   use_accelerate: true
@@ -96,7 +96,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 2
+  rotation_expand_times: 0
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false
