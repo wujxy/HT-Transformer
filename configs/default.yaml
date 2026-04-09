@@ -29,7 +29,7 @@ data:
   auto_t_max: false
   max_events: -1       # max events to preprocess (-1 = all events in h5 files)
   preprocess_batch_size: 512
-  num_workers: 8
+  num_workers: 32
   prefetch_factor: 2
 
 model:

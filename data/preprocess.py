@@ -215,7 +215,7 @@ def preprocess(config: dict):
                 ds, batch_size=batch_size, shuffle=False,
                 num_workers=num_workers, collate_fn=_identity_collate,
                 pin_memory=False, prefetch_factor=prefetch,
-                persistent_workers=num_workers > 0,
+                persistent_workers=False,
             )
             for batch_data in tqdm(loader, desc=f"Tokenizing {split_name}"):
                 all_events.extend(batch_data)
@@ -224,19 +224,67 @@ def preprocess(config: dict):
         logger.info(f"  {split_name}: {n} events → {h5_path}")
         return n
 
-    # Write train (original only first)
-    n_train_total = _tokenize_and_write(
-        'train', [train_idx],
-        os.path.join(preprocessed_dir, 'train.h5'),
+    # Write train (original only first) — skip if already done
+    train_h5_path = os.path.join(preprocessed_dir, 'train.h5')
+    expected_train_total = len(train_idx) * (1 + expand_times)
+    skip_train = False
+
+    if os.path.exists(train_h5_path):
+        with h5py.File(train_h5_path, 'r') as f:
+            existing_n = f['labels'].shape[0]
+        if existing_n == expected_train_total:
+            logger.info(f"train.h5 exists with {existing_n} events (expected {expected_train_total}), skipping train tokenization")
+            n_train_total = existing_n
+            skip_train = True
+        else:
+            logger.warning(f"train.h5 exists but has {existing_n} events (expected {expected_train_total}), re-processing train")
+
+    if not skip_train:
+        n_train_total = _tokenize_and_write(
+            'train', [train_idx],
+            train_h5_path,
+            apply_rotation=False,
+        )
+        # Append rotation-augmented copies to train.h5
+        for exp in range(expand_times):
+            logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
+            aug_events = []
+            ds = H5EndpointDataset(
+                h5_files, config, geometry, healpix,
+                indices=train_idx, is_train=False,
+                events_per_file=events_per_file,
+                apply_rotation_aug=True,
+            )
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, collate_fn=_identity_collate,
+                pin_memory=False, prefetch_factor=prefetch,
+                persistent_workers=False,
+            )
+            for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
+                aug_events.extend(batch_data)
+
+            _append_to_split_hdf5(
+                train_h5_path,
+                aug_events, npix, num_time_bins,
+            )
+            n_train_total += len(aug_events)
+        if expand_times > 0:
+            logger.info(f"  train (with aug): {n_train_total} events")
+
+    # --- Val: original + rotation copies (same pattern as train) ---
+    val_h5_path = os.path.join(preprocessed_dir, 'val.h5')
+    n_val_total = _tokenize_and_write(
+        'val', [val_idx],
+        val_h5_path,
         apply_rotation=False,
     )
-    # Append rotation-augmented copies to train.h5
     for exp in range(expand_times):
-        logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
+        logger.info(f"Val rotation augmentation {exp+1}/{expand_times}...")
         aug_events = []
         ds = H5EndpointDataset(
             h5_files, config, geometry, healpix,
-            indices=train_idx, is_train=False,
+            indices=val_idx, is_train=False,
             events_per_file=events_per_file,
             apply_rotation_aug=True,
         )
@@ -244,27 +292,43 @@ def preprocess(config: dict):
             ds, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, collate_fn=_identity_collate,
             pin_memory=False, prefetch_factor=prefetch,
-            persistent_workers=num_workers > 0,
+            persistent_workers=False,
         )
-        for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
+        for batch_data in tqdm(loader, desc=f"Val rotation {exp+1}/{expand_times}"):
             aug_events.extend(batch_data)
-
-        _append_to_split_hdf5(
-            os.path.join(preprocessed_dir, 'train.h5'),
-            aug_events, npix, num_time_bins,
-        )
-        n_train_total += len(aug_events)
+        _append_to_split_hdf5(val_h5_path, aug_events, npix, num_time_bins)
+        n_val_total += len(aug_events)
     if expand_times > 0:
-        logger.info(f"  train (with aug): {n_train_total} events")
+        logger.info(f"  val (with aug): {n_val_total} events")
 
-    n_val_total = _tokenize_and_write(
-        'val', [val_idx],
-        os.path.join(preprocessed_dir, 'val.h5'),
-    )
+    # --- Test: original + rotation copies (same pattern as train) ---
+    test_h5_path = os.path.join(preprocessed_dir, 'test.h5')
     n_test_total = _tokenize_and_write(
         'test', [test_idx],
-        os.path.join(preprocessed_dir, 'test.h5'),
+        test_h5_path,
+        apply_rotation=False,
     )
+    for exp in range(expand_times):
+        logger.info(f"Test rotation augmentation {exp+1}/{expand_times}...")
+        aug_events = []
+        ds = H5EndpointDataset(
+            h5_files, config, geometry, healpix,
+            indices=test_idx, is_train=False,
+            events_per_file=events_per_file,
+            apply_rotation_aug=True,
+        )
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=_identity_collate,
+            pin_memory=False, prefetch_factor=prefetch,
+            persistent_workers=False,
+        )
+        for batch_data in tqdm(loader, desc=f"Test rotation {exp+1}/{expand_times}"):
+            aug_events.extend(batch_data)
+        _append_to_split_hdf5(test_h5_path, aug_events, npix, num_time_bins)
+        n_test_total += len(aug_events)
+    if expand_times > 0:
+        logger.info(f"  test (with aug): {n_test_total} events")
 
     # --- Save shared metadata ---
     np.save(os.path.join(preprocessed_dir, 'cd_unit_vecs.npy'),
