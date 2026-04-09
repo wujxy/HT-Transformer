@@ -1,12 +1,12 @@
 """
-Hybrid Token Transformer for JUNO Ordered Dual-Endpoint Reconstruction (V3).
+Hybrid Token Transformer for JUNO Ordered Dual-Endpoint Reconstruction (V2.1).
 
 Architecture:
   WP hits (hit-level) + CD patches (HEALPix) + Global tokens + Query tokens
   → WP backbone (self-attention) + CD auxiliary (DeepSphere + conditioning)
   → Cross-modal readout → 2 Query outputs → Endpoint Heads → ordered unit vectors
 
-V3 Architecture (WP-backbone + CD-auxiliary):
+V2.1 Architecture (WP-backbone + CD-auxiliary):
   - WP processes independently through self-attention layers (backbone)
   - CD processes independently through DeepSphere + compression
   - Single-direction WP→CD conditioning: CD reads WP for trajectory context
@@ -436,7 +436,7 @@ class HTTransformer(nn.Module):
         except:
             self.cd_knn_adj = None
 
-        # Fusion encoder layers (V3: asymmetric WP-backbone + CD-auxiliary)
+        # Fusion encoder layers (V2.1: asymmetric WP-backbone + CD-auxiliary)
         # WP backbone: independent self-attention layers
         self.wp_layers = nn.ModuleList([
             WPSelfAttentionLayer(
@@ -530,7 +530,7 @@ class HTTransformer(nn.Module):
         # CD compression: fixed dense grid -> fixed low-res grid
         cd_emb, cd_mask = self.cd_compression(cd_emb, mask=cd_mask_input)
 
-        # ── WP independent encoding (V3: WP backbone, no CD interaction) ──
+        # ── WP independent encoding (V2.1: WP backbone, no CD interaction) ──
         wp_mask = batch['wp_mask']
         wp_attn_mask = wp_mask.unsqueeze(1) | wp_mask.unsqueeze(2)
 

@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3_rotation"
+mission_name: "ht_transformer_v2.1_rotation"
 output_path: "output"
 detector_type: "CDWP"
 

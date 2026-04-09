@@ -373,7 +373,7 @@ class Trainer:
         def count_params(module):
             return sum(p.numel() for p in module.parameters())
 
-        # V3 architecture components
+        # V2.1 architecture components
         wp_layers_params = count_params(m.wp_layers) if hasattr(m, 'wp_layers') else 0
         cd_cond_params = count_params(m.cd_conditioning) if hasattr(m, 'cd_conditioning') else 0
         readout_params = count_params(m.readout) if hasattr(m, 'readout') else 0
