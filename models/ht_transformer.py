@@ -4,14 +4,16 @@ Hybrid Token Transformer for JUNO Ordered Dual-Endpoint Reconstruction (V3).
 Architecture:
   WP hits (hit-level) + CD sparse PMT tokens + Global tokens + Query tokens
   → WP backbone (self-attention) + CD sparse encoder (self-attention)
+  → Bidirectional CD↔WP cross-attention fusion
   → Late fusion readout → 2 Query outputs → Endpoint Heads → ordered unit vectors
 
-V3 Architecture (CD Sparse PMT Token + Late Fusion):
+V3 Architecture (CD Sparse PMT Token + Cross-Attention Fusion):
   - CD: per-PMT aggregation + TopK charge selection → sparse PMT tokens
-  - CD: self-attention encoder (1 layer) → directly to late fusion (no compression)
+  - CD: self-attention encoder (1 layer)
   - WP: independent self-attention backbone (2 layers)
-  - Late fusion: Global/Query read from [WP, CD] (single-pass, no bidirectional)
-  - Information flows WP → Query, CD → Query (never CD → WP)
+  - Bidirectional fusion: CrossAttentionFusion (CD↔WP cross-attention) ×N
+  - Late fusion: Global/Query read from [WP, CD]
+  - Information flows: WP↔CD (bidirectional), WP/CD → Query
 
 WP features:
   - WPProjector: dual-branch [ux,uy,uz]⊕[q,t] feature extraction
@@ -162,6 +164,62 @@ class CDSparseEncoderLayer(nn.Module):
         return cd_out
 
 
+class CrossAttentionFusionLayer(nn.Module):
+    """Bidirectional CD↔WP cross-attention fusion layer.
+
+    In one layer:
+      CD→WP: WP queries attend to CD keys/values (WP gets CD context)
+      WP→CD: CD queries attend to WP keys/values (CD gets WP context)
+    Plus per-branch FFN.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 dropout: float = 0.1, norm_type: str = 'layernorm'):
+        super().__init__()
+        # WP→CD cross-attention (CD queries attend to WP)
+        self.cd_cross_norm = _get_norm(norm_type, d_model)
+        self.wp_cross_norm = _get_norm(norm_type, d_model)
+        self.cd_cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+
+        # CD→WP cross-attention (WP queries attend to CD)
+        self.wp_cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+
+        # Per-branch FFN
+        self.wp_ffn_norm = _get_norm(norm_type, d_model)
+        self.wp_ffn = FeedForward(d_model, d_ff, dropout)
+        self.cd_ffn_norm = _get_norm(norm_type, d_model)
+        self.cd_ffn = FeedForward(d_model, d_ff, dropout)
+
+    def forward(self, wp_emb: torch.Tensor, cd_emb: torch.Tensor,
+                wp_mask: torch.Tensor, cd_mask: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            wp_emb: (B, N_wp, D)
+            cd_emb: (B, K_cd, D)
+            wp_mask: (B, N_wp) bool, True = padding
+            cd_mask: (B, K_cd) bool, True = padding
+        Returns:
+            (wp_emb, cd_emb): updated embeddings
+        """
+        wp_normed = self.wp_cross_norm(wp_emb)
+        cd_normed = self.cd_cross_norm(cd_emb)
+
+        # CD→WP: WP queries attend to CD. mask: (B, N_wp, K_cd)
+        wp_cd_mask = cd_mask.unsqueeze(1).expand(-1, wp_emb.shape[1], -1)
+        wp_emb = wp_emb + self.wp_cross_attn(wp_normed, cd_normed, cd_normed, mask=wp_cd_mask)
+
+        # WP→CD: CD queries attend to WP. mask: (B, K_cd, N_wp)
+        cd_wp_mask = wp_mask.unsqueeze(1).expand(-1, cd_emb.shape[1], -1)
+        cd_emb = cd_emb + self.cd_cross_attn(cd_normed, wp_normed, wp_normed, mask=cd_wp_mask)
+
+        # Per-branch FFN
+        wp_emb = wp_emb + self.wp_ffn(self.wp_ffn_norm(wp_emb))
+        cd_emb = cd_emb + self.cd_ffn(self.cd_ffn_norm(cd_emb))
+
+        return wp_emb, cd_emb
+
+
 class CrossModalReadout(nn.Module):
     """Final readout: Global and Query tokens attend to [WP, CD]."""
 
@@ -246,7 +304,8 @@ class HTTransformer(nn.Module):
     V3 Architecture:
       WP: WPProjector → WPTimeEncoding → WPSelfAttentionLayer ×N
       CD: CDHitProjector → CDTimeEmbedding → CDSparseEncoderLayer ×1
-      Fusion: CrossModalReadout (Global/Query read [WP, CD])
+      Fusion: CrossAttentionFusion (CD↔WP bidirectional) ×N
+      Readout: CrossModalReadout (Global/Query read [WP, CD])
       Output: dual endpoint heads
     """
 
@@ -339,6 +398,19 @@ class HTTransformer(nn.Module):
             for _ in range(cd_layers)
         ])
 
+        # Bidirectional CD↔WP cross-attention fusion
+        fusion_layers = model_cfg.get('fusion_layers', 2)
+        self.fusion_layers = nn.ModuleList([
+            CrossAttentionFusionLayer(
+                d_model=self.d_model,
+                num_heads=model_cfg['num_heads'],
+                d_ff=model_cfg['d_ff'],
+                dropout=model_cfg.get('dropout', 0.1),
+                norm_type=self.norm_type,
+            )
+            for _ in range(fusion_layers)
+        ])
+
         # Cross-modal readout
         self.readout = CrossModalReadout(
             d_model=self.d_model,
@@ -412,7 +484,11 @@ class HTTransformer(nn.Module):
         for cd_layer in self.cd_sparse_encoder:
             cd_emb = cd_layer(cd_emb, cd_attn_mask)
 
-        # ── 6. Late fusion: CrossModalReadout ──
+        # ── 6. Bidirectional CD↔WP cross-attention fusion ──
+        for fusion_layer in self.fusion_layers:
+            wp_emb, cd_emb = fusion_layer(wp_emb, cd_emb, wp_mask, cd_mask)
+
+        # ── 7. Late fusion: CrossModalReadout ──
         M = self.num_global
         Q = self.num_queries
 

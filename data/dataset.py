@@ -32,6 +32,7 @@ def aggregate_cd_hits_by_pmt(
 ) -> np.ndarray:
     """
     Aggregate CD hits by PMT copyno into per-PMT feature vectors (v3).
+    Fully vectorized using numpy reduceat/bincount.
 
     Args:
         cd_copyno: (N_cd_hits,) PMT copyno
@@ -51,34 +52,70 @@ def aggregate_cd_hits_by_pmt(
     unique_pmts, inverse = np.unique(cd_copyno, return_inverse=True)
     n_pmts = len(unique_pmts)
 
+    # Sort by group (inverse) for reduceat operations
+    sort_idx = np.argsort(inverse, kind='mergesort')
+    sorted_charges = cd_charges[sort_idx]
+    sorted_times = cd_times[sort_idx]
+    sorted_unit_vecs = cd_unit_vecs[sort_idx]
+    sorted_inverse = inverse[sort_idx]
+
+    # Find group boundaries
+    _, group_starts = np.unique(sorted_inverse, return_index=True)
+    group_sizes = np.diff(np.append(group_starts, len(sorted_inverse))).astype(np.float32)
+
     features = np.zeros((n_pmts, 10), dtype=np.float32)
 
-    for i in range(n_pmts):
-        mask = (inverse == i)
-        q = cd_charges[mask]
-        t = cd_times[mask]
+    # [0:3] ux, uy, uz: first hit per group (same PMT, unit vec is identical)
+    features[:, :3] = sorted_unit_vecs[group_starts]
 
-        # Unit vector from geometry (fixed per PMT, not hit-level)
-        # Use first hit's unit vector (they're the same PMT, but may be rotated)
-        features[i, :3] = cd_unit_vecs[mask][0]
+    # [3] q_sum
+    features[:, 3] = np.add.reduceat(sorted_charges, group_starts)
 
-        # Raw charge stats
-        features[i, 3] = np.sum(q)   # q_sum
-        features[i, 4] = np.max(q)   # q_max
-        features[i, 5] = len(q)      # n_hits
+    # [4] q_max
+    features[:, 4] = np.maximum.reduceat(sorted_charges, group_starts)
 
-        # Raw time stats
-        features[i, 6] = np.min(t)   # t_first
-        q_sum = np.sum(q) + 1e-10
-        features[i, 7] = np.sum(q * t) / q_sum  # t_mean (charge-weighted)
+    # [5] n_hits
+    features[:, 5] = group_sizes
 
-        # t_late: use t90 (90th percentile), fallback to max for few hits
-        if len(t) >= 3:
-            features[i, 8] = np.percentile(t, 90)
-        else:
-            features[i, 8] = np.max(t)
+    # [6] t_first (min time)
+    features[:, 6] = np.minimum.reduceat(sorted_times, group_starts)
 
-        features[i, 9] = features[i, 8] - features[i, 6]  # t_span
+    # [7] t_mean (charge-weighted mean time)
+    sorted_qt = sorted_charges * sorted_times
+    sum_qt = np.add.reduceat(sorted_qt, group_starts)
+    sum_q = np.add.reduceat(sorted_charges, group_starts)
+    features[:, 7] = sum_qt / (sum_q + 1e-10)
+
+    # [8] t_late: t90 (90th percentile) for >=3 hits, max otherwise
+    # Sort by group, then by time within each group
+    secondary_sort = np.lexsort((sorted_times, sorted_inverse))
+    times_sorted_by_group_time = sorted_times[secondary_sort]
+
+    # Compute 90th percentile index per group
+    k_indices = np.ceil(0.9 * group_sizes).astype(int) - 1
+    k_indices = np.clip(k_indices, 0, group_sizes.astype(int) - 1)
+
+    # Cumulative offsets to index into flat sorted array
+    cum_sizes = np.zeros(n_pmts + 1, dtype=int)
+    np.cumsum(group_sizes.astype(int), out=cum_sizes[1:])
+    t90_indices = cum_sizes[:-1] + k_indices
+    features[:, 8] = times_sorted_by_group_time[t90_indices]
+
+    # For groups with <3 hits, use max instead of t90
+    small_groups = group_sizes < 3
+    if np.any(small_groups):
+        t_max_per_group = np.maximum.reduceat(sorted_times, group_starts)
+        features[small_groups, 8] = t_max_per_group[small_groups]
+
+    # [9] t_span
+    features[:, 9] = features[:, 8] - features[:, 6]
+
+    # --- Filter outlier PMTs (q_sum > p99) ---
+    # Remove PMTs with abnormally high charge (likely detector artifacts)
+    if n_pmts > 10:
+        q_p99 = np.percentile(features[:, 3], 99)
+        keep = features[:, 3] <= q_p99
+        features = features[keep]
 
     # --- Normalize scalar features ---
     # q_sum, q_max: log10(x+1) → clip p99 → min-max [0,1]
@@ -406,6 +443,26 @@ class H5EndpointDataset(Dataset):
         wp_unit = unit_vecs[wp_mask]     # (N_wp, 3)
         wp_charge = charge[wp_mask]
         wp_time = time[wp_mask]
+
+        # --- Charge p99 outlier filtering ---
+        # Remove hits/PMTs with abnormally high charge (detector artifacts)
+        # WP: hit-level filtering
+        if len(wp_charge) > 10:
+            wp_q_p99 = np.percentile(wp_charge, 99)
+            wp_keep = wp_charge <= wp_q_p99
+            wp_unit = wp_unit[wp_keep]
+            wp_charge = wp_charge[wp_keep]
+            wp_time = wp_time[wp_keep]
+
+        # CD: hit-level filtering before PMT aggregation
+        # (PMT-level filtering is done inside aggregate_cd_hits_by_pmt)
+        if len(cd_charge) > 10:
+            cd_q_p99 = np.percentile(cd_charge, 99)
+            cd_keep = cd_charge <= cd_q_p99
+            cd_copyno = cd_copyno[cd_keep]
+            cd_unit = cd_unit[cd_keep]
+            cd_charge = cd_charge[cd_keep]
+            cd_time = cd_time[cd_keep]
 
         # --- Normalize ---
         # Charge: CD/WP separate

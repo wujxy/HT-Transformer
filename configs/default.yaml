@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3_test"
+mission_name: "ht_transformer_v3"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -25,9 +25,9 @@ data:
   test_ratio: 0.05
   t_max: 800.0
   auto_t_max: false
-  max_events: 5000       # max events to preprocess (-1 = all events in h5 files)
+  max_events: -1       # max events to preprocess (-1 = all events in h5 files)
   preprocess_batch_size: 512
-  num_workers: 32
+  num_workers: 16
   prefetch_factor: 2
 
 model:
@@ -41,6 +41,7 @@ model:
 
   wp_self_layers: 2
   cd_self_layers: 1
+  fusion_layers: 2            # CD↔WP bidirectional cross-attention fusion layers
 
   num_global_tokens: 8
   num_queries: 2
