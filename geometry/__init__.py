@@ -1,5 +1,4 @@
-"""Detector geometry and HEALPix mapping utilities."""
+"""Detector geometry utilities."""
 from .detector_geometry import DualPMTPositionLookup, PMT_COPYNO_OFFSET
-from .healpix_mapper import HEALPixMapper
 
-__all__ = ['DualPMTPositionLookup', 'PMT_COPYNO_OFFSET', 'HEALPixMapper']
+__all__ = ['DualPMTPositionLookup', 'PMT_COPYNO_OFFSET']

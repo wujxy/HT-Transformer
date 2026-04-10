@@ -53,7 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Model overrides
     parser.add_argument('--d_model', type=int, default=None)
-    parser.add_argument('--num_layers', type=int, default=None)
     parser.add_argument('--num_heads', type=int, default=None)
     parser.add_argument('--d_ff', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=None)
@@ -93,7 +92,6 @@ def load_config(args=None) -> dict:
         'h5_val_path': ('data', 'h5_val_path'),
         'max_hits': ('data', 'max_hits'),
         'd_model': ('model', 'd_model'),
-        'num_layers': ('model', 'num_layers'),
         'num_heads': ('model', 'num_heads'),
         'd_ff': ('model', 'd_ff'),
         'batch_size': ('train', 'batch_size'),
@@ -147,41 +145,40 @@ def _default_config() -> dict:
             },
             'max_hits': 20012,
             'train_ratio': 0.8, 'val_ratio': 0.1, 'test_ratio': 0.1,
-            'nside': 8, 'num_time_bins': 32,
             't_max': 800.0, 'auto_t_max': False,
         },
         'model': {
-            'd_model': 128, 'num_layers': 4, 'num_heads': 4, 'd_ff': 512,
+            'd_model': 128, 'num_heads': 4, 'd_ff': 512,
             'num_queries': 2, 'num_global_tokens': 8,
-            'cd_knn_k': 16,
             'abs_posenc': 'fourier', 'fourier_freq': 32, 'dropout': 0.1,
             # WP projector (dual-branch)
             'wp_geo_hidden': 32,
             'wp_qt_hidden': 32,
             'wp_projector_hidden': 64,
-            # WP time bias
-            'wp_time_bias': 'signed_bucket',
-            'wp_num_time_buckets': 64,
-            'wp_time_bias_heads_shared': False,
-            # CD DeepSphere
-            'cd_deepsphere_layers': 4,
-            'cd_deepsphere_hidden': 256,
-            'cd_compression': 'healpix_pool',
-            'cd_fusion_tokens': 128,
-            'cd_compression_nside': 4,
+            # WP time encoding
+            'wp_time_encoding': True,
+            'wp_time_hidden': 32,
+            'wp_time_fourier_dim': 16,
+            # CD sparse PMT tokens (v3)
+            'cd_max_tokens': 640,
+            'cd_latent_tokens': 64,
+            'cd_self_layers': 1,
+            'cd_time_embedding': True,
+            'cd_time_hidden': 32,
+            'cd_time_fourier_dim': 16,
             # Global normalization
             'norm_type': 'rmsnorm',
         },
         'loss': {'lambda_ang': 1.0, 'lambda_len': 0.5, 'lambda_dir': 0.25},
         'train': {
             'optimizer': 'adamw', 'lr': 3e-4, 'weight_decay': 1e-2,
-            # V2 scheduler: Warmup + ReduceLROnPlateau (fixed configuration)
+            # Warmup + ReduceLROnPlateau scheduler
             'warmup_epochs': 5,       # Linear warmup epochs at start
             'plateau_factor': 0.5,    # LR reduction factor on plateau
             'plateau_patience': 5,    # Epochs to wait before reducing LR
             'plateau_threshold': 1e-3, # Minimum change to qualify as improvement
             'plateau_min_lr': 1e-6,   # Minimum learning rate
-            # Early stopping (V2)
+            # Early stopping
             'early_stop_patience': 8,
             'early_stop_monitor': 'val_dir_ang_p68',  # Metric to monitor
             'early_stop_mode': 'min',

@@ -9,9 +9,6 @@ h5py>=3.0.0
 numpy>=1.21.0
 pandas>=1.3.0
 
-# HEALPix patch mapping
-healpy>=1.15.0
-
 # Configuration
 pyyaml>=5.0
 

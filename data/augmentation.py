@@ -3,8 +3,8 @@ Rotation Augmentation: random SO(3) rotation matrices.
 
 Reference: doc/ROTATION_AUG.md
 
-Rotation is applied to raw PMT positions BEFORE tokenization, so HEALPix
-patch mapping changes and all derived quantities are recalculated naturally.
+Rotation is applied to raw PMT positions BEFORE tokenization, so all
+derived quantities (unit vectors, geometry features) are recalculated naturally.
 
 Each event independently samples a random SO(3) rotation at load time
 (when apply_rotation_aug=True).

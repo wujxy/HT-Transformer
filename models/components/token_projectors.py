@@ -1,5 +1,5 @@
 """
-Token Projectors for WP and CD tokens (V2 Architecture).
+Token Projectors for WP and CD tokens (V3 Architecture).
 
 Maps raw token features to unified d_model dimension.
 Includes type embedding (WP, CD, GLOBAL, QUERY) and Fourier position encoding.
@@ -7,8 +7,6 @@ Includes type embedding (WP, CD, GLOBAL, QUERY) and Fourier position encoding.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 
 # Token type IDs
@@ -78,64 +76,6 @@ class WPProjector(nn.Module):
         return self.fusion(combined)
 
 
-class CDProjector(nn.Module):
-    """
-    Project CD patch token to d_model.
-
-    Input: pixel_unit_vec (3) + first-level stats (4) + time-bin embedding
-    Time-bin encoder: Conv1d -> GELU -> Conv1d -> GELU -> GAP -> Linear
-    """
-
-    def __init__(self, num_time_bins: int = 32, d_model: int = 128,
-                 d_stats: int = 32, d_time: int = 32):
-        super().__init__()
-        # Stats projector: [ux, uy, uz, sumQ, count, t_min, t_mean] = 7 -> d_stats
-        self.stats_proj = nn.Sequential(
-            nn.Linear(7, d_stats),
-            nn.GELU(),
-        )
-
-        # Time-bin encoder: Conv1d pipeline
-        self.time_encoder = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(16, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
-        self.time_gap = nn.AdaptiveAvgPool1d(1)
-        self.time_proj = nn.Linear(16, d_time)
-
-        # Fusion
-        self.fusion = nn.Linear(d_stats + d_time, d_model)
-
-    def forward(self, patch_unit_vecs: torch.Tensor, patch_stats: torch.Tensor,
-                patch_time_bins: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            patch_unit_vecs: (B, N_patches, 3) pixel center unit vectors
-            patch_stats: (B, N_patches, 4) [sumQ, count, t_min, t_mean]
-            patch_time_bins: (B, N_patches, B_bins) time-bin charge histograms
-
-        Returns:
-            (B, N_patches, d_model)
-        """
-        # Concatenate unit vec + stats
-        stats_input = torch.cat([patch_unit_vecs, patch_stats], dim=-1)  # (B, N, 7)
-        stats_emb = self.stats_proj(stats_input)  # (B, N, d_stats)
-
-        # Time-bin encoder
-        B, N, B_bins = patch_time_bins.shape
-        tb = patch_time_bins.view(B * N, 1, B_bins)  # (B*N, 1, B_bins)
-        tb = self.time_encoder(tb)  # (B*N, 16, B_bins)
-        tb = self.time_gap(tb).squeeze(-1)  # (B*N, 16)
-        tb = self.time_proj(tb)  # (B*N, d_time)
-        tb = tb.view(B, N, -1)  # (B, N, d_time)
-
-        # Fusion
-        combined = torch.cat([stats_emb, tb], dim=-1)  # (B, N, d_stats + d_time)
-        return self.fusion(combined)
-
-
 class TokenTypeEmbedding(nn.Module):
     """Learnable type embedding for WP, CD, GLOBAL, QUERY tokens."""
 
@@ -183,7 +123,118 @@ class FourierPositionEncoding(nn.Module):
 
 
 __all__ = [
-    'WPProjector', 'CDProjector',
+    'WPProjector', 'CDHitProjector', 'CDTimeEmbedding',
     'TokenTypeEmbedding', 'FourierPositionEncoding',
     'TOKEN_WP', 'TOKEN_CD', 'TOKEN_GLOBAL', 'TOKEN_QUERY',
 ]
+
+
+class CDHitProjector(nn.Module):
+    """
+    Project sparse CD PMT tokens (10-dim) to d_model (v3).
+
+    Dual-branch:
+      geo branch: [ux, uy, uz] -> MLP -> d_geo
+      physics-time branch: [q_sum, q_max, n_hits, t_first, t_mean, t_late, t_span] -> MLP -> d_pt
+    Concat -> fusion MLP -> d_model
+
+    Input:  (B, K_cd, 10)
+    Output: (B, K_cd, d_model)
+    """
+
+    def __init__(self, d_model: int = 128, d_geo: int = 32, d_pt: int = 64,
+                 hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        # Geometry branch: [ux, uy, uz]
+        self.geo_branch = nn.Sequential(
+            nn.Linear(3, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_geo),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Physics-time branch: [q_sum, q_max, n_hits, t_first, t_mean, t_late, t_span]
+        self.pt_branch = nn.Sequential(
+            nn.Linear(7, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_pt),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(d_geo + d_pt, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, cd_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cd_tokens: (B, K_cd, 10) [ux,uy,uz,q_sum,q_max,n_hits,t_first,t_mean,t_late,t_span]
+
+        Returns:
+            (B, K_cd, d_model)
+        """
+        geo_features = self.geo_branch(cd_tokens[..., :3])    # (B, K, d_geo)
+        pt_features = self.pt_branch(cd_tokens[..., 3:])      # (B, K, d_pt)
+        combined = torch.cat([geo_features, pt_features], dim=-1)
+        return self.fusion(combined)
+
+
+class CDTimeEmbedding(nn.Module):
+    """
+    Additive time embedding for CD PMT tokens (v3).
+
+    Input: [t_first, t_mean, t_late, t_span] (4-dim, normalized to [0,1])
+    Output: (B, K_cd, d_model)
+
+    Uses Fourier features per time dimension + MLP, same philosophy as WPTimeEncoding.
+    SDPA-compatible: time is injected as additive token-level embedding.
+    """
+
+    def __init__(self, d_model: int = 128, hidden: int = 32, fourier_dim: int = 16):
+        super().__init__()
+        self.d_model = d_model
+        self.hidden = hidden
+        self.fourier_dim = fourier_dim
+
+        # Learnable frequency scales for Fourier encoding (4 time features)
+        freqs = torch.randn(1, 1, 4, fourier_dim) * 4.0
+        self.register_buffer("freqs", freqs)
+
+        # MLP: [4 raw, 4*2*fourier_dim sin/cos] -> d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(4 + 4 * 2 * fourier_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self, cd_time_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cd_time_features: (B, K_cd, 4) [t_first, t_mean, t_late, t_span]
+
+        Returns:
+            (B, K_cd, d_model) time embeddings
+        """
+        # (B, K, 4) -> (B, K, 4, 1) * (1, 1, 4, F) -> (B, K, 4, F)
+        t = cd_time_features.unsqueeze(-1)
+        proj = t * self.freqs
+
+        # (B, K, 4, F) -> sin/cos
+        sin_feat = torch.sin(proj)  # (B, K, 4, F)
+        cos_feat = torch.cos(proj)  # (B, K, 4, F)
+
+        # Flatten Fourier features: (B, K, 4*2*F)
+        fourier_flat = torch.cat([sin_feat, cos_feat], dim=-1).reshape(
+            *cd_time_features.shape[:2], -1)
+
+        # Concat raw + Fourier: (B, K, 4 + 4*2*F)
+        feat = torch.cat([cd_time_features, fourier_flat], dim=-1)
+
+        return self.mlp(feat)

@@ -13,9 +13,6 @@ import numpy as np
 from loguru import logger
 
 
-PMT_RADIUS = 19433.975  # mm
-
-
 class Normalizer:
     """Normalization utilities for hit-level and endpoint data."""
 
@@ -82,30 +79,6 @@ class Normalizer:
             return (charges - cmin) / (cmax - cmin)
         else:
             return np.zeros_like(charges)
-
-    @staticmethod
-    def normalize_charge_cdwp(cd_charges: np.ndarray, wp_charges: np.ndarray,
-                              apply_log: bool = True):
-        from typing import Tuple
-        """
-        Normalize CD and WP charges independently.
-
-        Args:
-            cd_charges: (N_cd,) CD charge values
-            wp_charges: (N_wp,) WP charge values
-            apply_log: whether to apply log10 transform
-
-        Returns:
-            (norm_cd, norm_wp) tuple of normalized charges
-        """
-        norm_cd = Normalizer.normalize_charge(cd_charges, apply_log=apply_log)
-        norm_wp = Normalizer.normalize_charge(wp_charges, apply_log=apply_log)
-        return norm_cd, norm_wp
-
-    @staticmethod
-    def normalize_position(positions: np.ndarray) -> np.ndarray:
-        """Normalize positions by PMT_RADIUS."""
-        return positions / PMT_RADIUS
 
     @staticmethod
     def normalize_endpoint(xyz: np.ndarray) -> np.ndarray:

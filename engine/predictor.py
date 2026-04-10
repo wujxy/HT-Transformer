@@ -1,5 +1,5 @@
 """
-Prediction module for HT-Transformer Endpoint Reconstruction.
+Prediction module for HT-Transformer Endpoint Reconstruction (v3).
 
 Loads checkpoint, runs inference, saves results.
 """
@@ -11,29 +11,20 @@ from loguru import logger
 
 from config.loader import load_config
 from geometry.detector_geometry import DualPMTPositionLookup
-from geometry.healpix_mapper import HEALPixMapper
 from data.dataset import create_dataloaders
 from models.ht_transformer import HTTransformer
 
 
 class Predictor:
-    """Prediction orchestration for HT-Transformer."""
+    """Prediction orchestration for HT-Transformer (v3)."""
 
     def __init__(self, config: dict, checkpoint_path: str):
         self.cfg = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Geometry + HEALPix
+        # Geometry
         self.geometry = DualPMTPositionLookup(
             config['data']['geometry_cd'], config['data']['geometry_wp'])
-
-        cd_unit_vecs = self.geometry.cd_position_array.copy()
-        norms = np.linalg.norm(cd_unit_vecs, axis=1, keepdims=True)
-        valid = (norms.squeeze() > 0)
-        cd_unit_vecs[valid] = cd_unit_vecs[valid] / norms[valid]
-
-        self.healpix = HEALPixMapper(nside=config['data']['nside'], cd_unit_vecs=cd_unit_vecs)
-        self.healpix.build_knn_adjacency(k=config['model']['cd_knn_k'])
 
         # Model
         self.model = HTTransformer(config).to(self.device)
@@ -67,7 +58,7 @@ class Predictor:
         os.makedirs(output_dir, exist_ok=True)
 
         # Create dataloader (use all data as test)
-        _, _, test_loader = create_dataloaders(self.cfg, self.geometry, self.healpix)
+        _, _, test_loader = create_dataloaders(self.cfg, self.geometry)
 
         all_pred_u1 = []
         all_pred_u2 = []

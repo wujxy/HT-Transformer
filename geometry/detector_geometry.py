@@ -131,23 +131,3 @@ class DualPMTPositionLookup:
         norms = np.linalg.norm(positions, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
         return positions / norms
-
-    def get_spherical_coords(self, copynos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get spherical coordinates (theta, phi) in radians for PMTs.
-        Useful for HEALPix mapping.
-
-        Args:
-            copynos: (N,) array of PMT copyno values
-
-        Returns:
-            theta: (N,) polar angle [0, pi]
-            phi:   (N,) azimuthal angle [0, 2*pi)
-        """
-        unit_vecs = self.get_unit_vectors(copynos)
-        # unit_vecs: (N, 3) = (sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta))
-        # But actually XYZ, so:
-        x, y, z = unit_vecs[:, 0], unit_vecs[:, 1], unit_vecs[:, 2]
-        theta = np.arccos(np.clip(z, -1.0, 1.0))
-        phi = np.arctan2(y, x) % (2 * np.pi)
-        return theta.astype(np.float64), phi.astype(np.float64)

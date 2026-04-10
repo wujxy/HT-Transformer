@@ -19,7 +19,6 @@ from models.ht_transformer import HTTransformer
 from models.losses.endpoint_loss import EndpointLoss
 from data.dataset import create_dataloaders
 from geometry.detector_geometry import DualPMTPositionLookup
-from geometry.healpix_mapper import HEALPixMapper
 
 try:
     from accelerate import Accelerator
@@ -236,29 +235,17 @@ class Trainer:
             worker_seed = seed + self.accelerator.process_index
             random.seed(worker_seed)
 
-        # Geometry + HEALPix
+        # Geometry
         logger.info("Loading geometry...")
         self.geometry = DualPMTPositionLookup(
             self.data_cfg['geometry_cd'],
             self.data_cfg['geometry_wp'],
         )
 
-        # Build CD unit vecs for HEALPix lookup
-        cd_max = len(self.geometry.cd_position_array)
-        cd_unit_vecs = self.geometry.cd_position_array.copy()
-        norms = np.linalg.norm(cd_unit_vecs, axis=1, keepdims=True)
-        valid = (norms.squeeze() > 0)
-        cd_unit_vecs[valid] = cd_unit_vecs[valid] / norms[valid]
-
-        self.healpix = HEALPixMapper(
-            nside=self.data_cfg['nside'],
-            cd_unit_vecs=cd_unit_vecs,
-        )
-
         # Data
         logger.info("Creating dataloaders...")
         self.train_loader, self.val_loader, self.test_loader = create_dataloaders(
-            config, self.geometry, self.healpix)
+            config, self.geometry)
 
         # Model
         logger.info("Building model...")
@@ -295,7 +282,7 @@ class Trainer:
         )
         logger.info(f"Using Warmup+Plateau scheduler: warmup_epochs={warmup_epochs}")
 
-        # Early stopping (V2)
+        # Early stopping
         if self.train_cfg.get('early_stop_patience', 0) > 0:
             self.early_stopping = EarlyStopping(
                 patience=self.train_cfg['early_stop_patience'],
@@ -347,23 +334,21 @@ class Trainer:
 
         lines = [
             sep,
-            "Model Architecture Summary (V2)",
+            "Model Architecture Summary (V3)",
             sep,
-            f"  d_model={m.d_model}, num_layers={m.num_layers}, "
+            f"  d_model={m.d_model}, "
             f"num_heads={mc['num_heads']}, d_ff={mc['d_ff']}, "
             f"head_dim={m.d_model // mc['num_heads']}",
             f"  num_global_tokens={m.num_global}, num_queries={m.num_queries}, "
-            f"cd_knn_k={mc['cd_knn_k']}, nside={dc['nside']}",
+            f"cd_max_tokens={mc.get('cd_max_tokens', 640)}",
             "",
-            f"  Architecture (V2 with DeepSphere):",
+            f"  Architecture (V3 Sparse PMT Token + Late Fusion):",
             f"    WP projector      : dual-branch [ux,uy,uz]⊕[q,t]",
-            f"    CD encoder        : DeepSphere ({mc.get('cd_deepsphere_layers', 4)} layers)",
-            f"    CD compression    : {mc.get('cd_compression', 'healpix_pool')} -> {mc.get('cd_fusion_tokens', 128)} tokens",
-            f"    WP self-attn      : dense + signed time bias",
-            f"    WP->CD cross-attn : dense, (B, H, N_wp, N_cd)",
-            f"    CD->WP cross-attn : dense, (B, H, N_cd, N_wp)",
-            f"    Global->All attn  : dense, (B, H, {m.num_global}, N_wp+N_cd)",
-            f"    Query->All attn   : dense, (B, H, {m.num_queries}, N_wp+N_cd+{m.num_global})",
+            f"    CD Hit Projector  : dual-branch [ux,uy,uz]⊕[q_sum,q_max,n_hits,t_first,t_mean,t_late,t_span]",
+            f"    CD Time Embedding : Fourier + MLP",
+            f"    WP self-attn      : {mc.get('wp_self_layers', 2)} layers",
+            f"    CD sparse encoder : {mc.get('cd_self_layers', 1)} layer",
+            f"    Late fusion       : Global→[WP,CD], Query→[WP,CD,G] (no CD compression)",
             f"    FFN               : Linear({m.d_model}->{mc['d_ff']}) -> GELU -> Linear({mc['d_ff']}->{m.d_model})",
             "",
             "  Parameter breakdown:",
@@ -373,21 +358,17 @@ class Trainer:
         def count_params(module):
             return sum(p.numel() for p in module.parameters())
 
-        # V2.1 architecture components
-        wp_layers_params = count_params(m.wp_layers) if hasattr(m, 'wp_layers') else 0
-        cd_cond_params = count_params(m.cd_conditioning) if hasattr(m, 'cd_conditioning') else 0
-        readout_params = count_params(m.readout) if hasattr(m, 'readout') else 0
+        # V3 architecture components
         components = [
             ("WP Projector      ", count_params(m.wp_projector)),
-            ("CD Projector      ", count_params(m.cd_projector)),
-            ("CD Encoder (DeepSphere)", count_params(m.cd_encoder) if hasattr(m, 'cd_encoder') else 0),
-            ("CD Compression    ", count_params(m.cd_compression) if hasattr(m, 'cd_compression') else 0),
+            ("CD Hit Projector  ", count_params(m.cd_hit_projector) if hasattr(m, 'cd_hit_projector') else 0),
+            ("CD Time Embedding ", count_params(m.cd_time_embedding) if hasattr(m, 'cd_time_embedding') and m.cd_time_embedding is not None else 0),
             ("WP Time Encoding  ", count_params(m.wp_time_encoding) if hasattr(m, 'wp_time_encoding') and m.wp_time_encoding is not None else 0),
             ("Type Embedding    ", count_params(m.type_embedding)),
             ("Position Encoding ", count_params(m.abs_pe)),
-            ("WP Layers         ", wp_layers_params),
-            ("CD Conditioning   ", cd_cond_params),
-            ("CrossModal Readout", readout_params),
+            ("WP Layers         ", count_params(m.wp_layers) if hasattr(m, 'wp_layers') else 0),
+            ("CD Sparse Encoder ", count_params(m.cd_sparse_encoder) if hasattr(m, 'cd_sparse_encoder') else 0),
+            ("CrossModal Readout", count_params(m.readout) if hasattr(m, 'readout') else 0),
             ("Output Heads      ", count_params(m.head1) + count_params(m.head2)),
             ("Learnable Tokens  ", count_params(nn.ParameterList([m.global_tokens, m.query_tokens]))),
         ]
@@ -516,7 +497,7 @@ class Trainer:
                     self._plot_training_curves()
                 self._eval_and_plot(epoch)
 
-            # --- Early stopping check (V2) ---
+            # --- Early stopping check ---
             if self.early_stopping is not None and (epoch + 1) % eval_every == 0:
                 # Get monitored metric from history
                 metric_key = self.early_stop_monitor

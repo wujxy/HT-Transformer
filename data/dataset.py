@@ -1,11 +1,11 @@
 """
-DataLoader for JUNO CDWP HT-Transformer.
+DataLoader for JUNO CDWP HT-Transformer (v3).
 
 Reads h5 files, separates CD/WP hits, performs:
 - WP tokenization: [ux, uy, uz, q, t] per hit
-- CD tokenization: HEALPix patch aggregation with two-level time representation
+- CD tokenization: per-PMT aggregation + TopK charge selection (v3 sparse PMT tokens)
 
-Produces batch dicts compatible with Model.py.
+Produces batch dicts compatible with HTTransformer.
 """
 
 import os
@@ -16,87 +16,161 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, List, Optional, Tuple, Union
 import h5py
-import healpy as hp
 from loguru import logger
 
 from geometry.detector_geometry import DualPMTPositionLookup, PMT_COPYNO_OFFSET
 from data.normalization import Normalizer
-from geometry.healpix_mapper import HEALPixMapper
 
 
-def build_dense_cd_patches(
-    pixel_ids: np.ndarray,
-    cd_unit_vecs_hits: np.ndarray,
-    cd_times: np.ndarray,
+def aggregate_cd_hits_by_pmt(
+    cd_copyno: np.ndarray,
+    cd_unit_vecs: np.ndarray,
     cd_charges: np.ndarray,
-    pixel_center_vecs: np.ndarray,
-    npix: int,
-    num_time_bins: int,
+    cd_times: np.ndarray,
+    geometry: DualPMTPositionLookup,
     t_max: float,
-):
+) -> np.ndarray:
     """
-    Build dense HEALPix patch representation for Stage B.
-
-    Stage B optimization: Returns fixed-shape dense HEALPix grid instead of
-    variable-length active patch list. This enables:
-    - Fixed graph topology for DeepSphere
-    - No runtime local graph construction
-    - Better SDPA/compile compatibility
+    Aggregate CD hits by PMT copyno into per-PMT feature vectors (v3).
 
     Args:
-        pixel_ids: (N_hits,) HEALPix pixel id per CD hit
-        cd_unit_vecs_hits: (N_hits, 3) CD hit directions
-        cd_times: (N_hits,) normalized times [0, 1]
-        cd_charges: (N_hits,) normalized charges
-        pixel_center_vecs: (npix, 3) fixed HEALPix pixel center unit vectors
-        npix: total number of pixels for nside (12 * nside^2)
-        num_time_bins: number of time bins
-        t_max: max time for binning (used for time bin calculation)
+        cd_copyno: (N_cd_hits,) PMT copyno
+        cd_unit_vecs: (N_cd_hits, 3) CD hit direction unit vectors (may be rotated)
+        cd_charges: (N_cd_hits,) raw charge in PE
+        cd_times: (N_cd_hits,) raw time in ns
+        geometry: DualPMTPositionLookup for PMT unit vector lookup
+        t_max: max time for normalization
 
     Returns:
-        cd_unit_vecs_dense: (npix, 3) pixel center unit vectors
-        cd_stats_dense: (npix, 4) [sumQ, count, t_min, t_mean]
-        cd_time_bins_dense: (npix, num_time_bins) time histograms
-        cd_mask_dense: (npix,) True = inactive (no hits)
-        cd_times_mean: (npix,) charge-weighted mean time per pixel
+        pmt_features: (N_unique_pmts, 10) [ux, uy, uz, q_sum, q_max, n_hits,
+                     t_first, t_mean, t_late, t_span]
     """
-    # Initialize with fixed shape
-    cd_unit_vecs_dense = pixel_center_vecs.astype(np.float32).copy()
-    cd_stats_dense = np.zeros((npix, 4), dtype=np.float32)
-    cd_time_bins_dense = np.zeros((npix, num_time_bins), dtype=np.float32)
-    cd_mask_dense = np.ones((npix,), dtype=bool)  # True = inactive
+    if len(cd_copyno) == 0:
+        return np.zeros((0, 10), dtype=np.float32)
 
-    if len(pixel_ids) == 0:
-        cd_times_mean = np.zeros((npix,), dtype=np.float32)
-        return cd_unit_vecs_dense, cd_stats_dense, cd_time_bins_dense, cd_mask_dense, cd_times_mean
+    unique_pmts, inverse = np.unique(cd_copyno, return_inverse=True)
+    n_pmts = len(unique_pmts)
 
-    # Group hits by pixel and aggregate
-    unique_pixels = np.unique(pixel_ids)
-    for pix in unique_pixels:
-        mask = (pixel_ids == pix)
-        hit_q = cd_charges[mask]
-        hit_t = cd_times[mask]
+    features = np.zeros((n_pmts, 10), dtype=np.float32)
 
-        # Aggregate stats
-        cd_stats_dense[pix, 0] = hit_q.sum()  # sumQ
-        cd_stats_dense[pix, 1] = len(hit_q)   # count
-        cd_stats_dense[pix, 2] = hit_t.min() if len(hit_t) > 0 else 0.0  # t_min
-        cd_stats_dense[pix, 3] = (hit_q * hit_t).sum() / (hit_q.sum() + 1e-10)  # t_mean
+    for i in range(n_pmts):
+        mask = (inverse == i)
+        q = cd_charges[mask]
+        t = cd_times[mask]
 
-        # Time bins (times already normalized to [0, 1])
-        bin_idx = np.clip(
-            (hit_t * num_time_bins).astype(np.int32),
-            0, num_time_bins - 1
-        )
-        np.add.at(cd_time_bins_dense[pix], bin_idx, hit_q)
+        # Unit vector from geometry (fixed per PMT, not hit-level)
+        # Use first hit's unit vector (they're the same PMT, but may be rotated)
+        features[i, :3] = cd_unit_vecs[mask][0]
 
-        # Mark as active
-        cd_mask_dense[pix] = False
+        # Raw charge stats
+        features[i, 3] = np.sum(q)   # q_sum
+        features[i, 4] = np.max(q)   # q_max
+        features[i, 5] = len(q)      # n_hits
 
-    # Extract t_mean as separate array for convenience
-    cd_times_mean = cd_stats_dense[:, 3].copy()
+        # Raw time stats
+        features[i, 6] = np.min(t)   # t_first
+        q_sum = np.sum(q) + 1e-10
+        features[i, 7] = np.sum(q * t) / q_sum  # t_mean (charge-weighted)
 
-    return cd_unit_vecs_dense, cd_stats_dense, cd_time_bins_dense, cd_mask_dense, cd_times_mean
+        # t_late: use t90 (90th percentile), fallback to max for few hits
+        if len(t) >= 3:
+            features[i, 8] = np.percentile(t, 90)
+        else:
+            features[i, 8] = np.max(t)
+
+        features[i, 9] = features[i, 8] - features[i, 6]  # t_span
+
+    # --- Normalize scalar features ---
+    # q_sum, q_max: log10(x+1) → clip p99 → min-max [0,1]
+    for col in [3, 4]:
+        raw = features[:, col]
+        log_val = np.log10(raw + 1)
+        p99 = np.percentile(log_val, 99) if len(log_val) > 0 else 1.0
+        clipped = np.clip(log_val, 0, p99)
+        cmin, cmax = clipped.min(), clipped.max()
+        if cmax > cmin:
+            features[:, col] = (clipped - cmin) / (cmax - cmin)
+        else:
+            features[:, col] = 0.0
+
+    # n_hits: log10(n+1) → min-max
+    nh = np.log10(features[:, 5] + 1).astype(np.float32)
+    cmin, cmax = nh.min(), nh.max()
+    if cmax > cmin:
+        features[:, 5] = (nh - cmin) / (cmax - cmin)
+    else:
+        features[:, 5] = 0.0
+
+    # t_first, t_mean, t_late, t_span: clip [0, t_max] / t_max
+    for col in [6, 7, 8, 9]:
+        features[:, col] = np.clip(features[:, col], 0, t_max) / t_max
+
+    return features
+
+
+def select_topk_cd_tokens_by_charge(
+    pmt_features: np.ndarray,
+    K_cd: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Select top-K CD PMT tokens by q_sum (column 3).
+
+    Args:
+        pmt_features: (N_pmts, 10) aggregated PMT features
+        K_cd: maximum number of tokens to keep
+
+    Returns:
+        cd_tokens: (K_cd, 10) zero-padded if N < K_cd
+        cd_mask: (K_cd,) bool, True = padding
+    """
+    N = pmt_features.shape[0]
+
+    if N == 0:
+        return np.zeros((K_cd, 10), dtype=np.float32), np.ones(K_cd, dtype=bool)
+
+    # Sort by q_sum (column 3) descending
+    order = np.argsort(-pmt_features[:, 3])
+    sorted_features = pmt_features[order]
+
+    if N >= K_cd:
+        return sorted_features[:K_cd].copy(), np.zeros(K_cd, dtype=bool)
+    else:
+        cd_tokens = np.zeros((K_cd, 10), dtype=np.float32)
+        cd_tokens[:N] = sorted_features
+        cd_mask = np.ones(K_cd, dtype=bool)
+        cd_mask[:N] = False
+        return cd_tokens, cd_mask
+
+
+def build_v3_cd_tokens(
+    cd_copyno: np.ndarray,
+    cd_unit_vecs: np.ndarray,
+    cd_charges: np.ndarray,
+    cd_times: np.ndarray,
+    geometry: DualPMTPositionLookup,
+    t_max: float,
+    K_cd: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build v3 CD sparse PMT tokens: aggregate by PMT then select TopK by charge.
+
+    Args:
+        cd_copyno: (N_cd_hits,) PMT copyno
+        cd_unit_vecs: (N_cd_hits, 3) CD hit direction unit vectors
+        cd_charges: (N_cd_hits,) raw charge
+        cd_times: (N_cd_hits,) raw time in ns
+        geometry: DualPMTPositionLookup
+        t_max: max time for normalization
+        K_cd: max CD tokens per event
+
+    Returns:
+        cd_tokens: (K_cd, 10)
+        cd_mask: (K_cd,) bool, True = padding
+    """
+    pmt_features = aggregate_cd_hits_by_pmt(
+        cd_copyno, cd_unit_vecs, cd_charges, cd_times, geometry, t_max
+    )
+    return select_topk_cd_tokens_by_charge(pmt_features, K_cd)
 
 
 def discover_h5_files(path: Union[str, List[str]]) -> List[str]:
@@ -141,16 +215,15 @@ def discover_h5_files(path: Union[str, List[str]]) -> List[str]:
 
 class H5EndpointDataset(Dataset):
     """
-    H5 dataset for endpoint reconstruction.
+    H5 dataset for endpoint reconstruction (v3).
 
     Supports multiple H5 files via a (file_id, local_idx) dual-index mapping.
-    Reads events from h5, tokenizes into WP hits + CD patches,
-    returns batch dict for HT-Transformer.
+    Reads events from h5, tokenizes into WP hits + CD sparse PMT tokens,
+    returns batch dict for HT-Transformer v3.
     """
 
     def __init__(self, h5_files: Union[str, List[str]], config: dict,
                  geometry: DualPMTPositionLookup,
-                 healpix: HEALPixMapper,
                  indices: Optional[np.ndarray] = None,
                  is_train: bool = True,
                  events_per_file: Optional[List[int]] = None,
@@ -164,7 +237,6 @@ class H5EndpointDataset(Dataset):
                 - list of file paths
             config: full config dict
             geometry: DualPMTPositionLookup instance
-            healpix: HEALPixMapper instance
             indices: global event indices to use (for train/val/test split)
             is_train: whether this is training mode
             events_per_file: pre-computed list of event counts per file (avoids re-scanning)
@@ -182,17 +254,17 @@ class H5EndpointDataset(Dataset):
         self.data_cfg = config['data']
         self.model_cfg = config['model']
         self.geo = geometry
-        self.healpix = healpix
         self.is_train = is_train
-        self._apply_rotation_aug = apply_rotation_aug  # per-event random SO(3) rotation
+        self._apply_rotation_aug = apply_rotation_aug
 
         # Key mapping
         self.km = self.data_cfg['h5_key_map']
 
         # Normalization params
         self.t_max = self.data_cfg['t_max']
-        self.num_time_bins = self.data_cfg['num_time_bins']
-        self.nside = self.data_cfg['nside']
+
+        # v3 CD config
+        self.K_cd = self.model_cfg.get('cd_max_tokens', 640)
 
         # Build file index (global_idx -> file_id, local_idx)
         self._build_file_index(events_per_file)
@@ -208,7 +280,7 @@ class H5EndpointDataset(Dataset):
             logger.info(f"Auto-estimated t_max = {self.t_max:.1f} ns")
 
         n_files = len(self._file_paths)
-        logger.info(f"H5EndpointDataset: {len(self.indices)} events from {n_files} file(s)")
+        logger.info(f"H5EndpointDataset: {len(self.indices)} events from {n_files} file(s), K_cd={self.K_cd}")
 
         # Tokenization cache (keyed by global_idx)
         self._use_cache = self.data_cfg.get('use_cache', True)
@@ -352,60 +424,31 @@ class H5EndpointDataset(Dataset):
         else:
             wp_tokens = np.zeros((0, 5), dtype=np.float32)
 
-        # --- CD patch tokens: Stage B dense HEALPix grid representation ---
+        # --- CD v3: per-PMT aggregation + TopK charge selection ---
         N_cd = len(cd_unit)
-        npix = self.healpix.npix  # Fixed: 12 * nside^2
 
         if N_cd > 0:
-            # When rotation is applied, PMT positions changed → HEALPix pixel assignment changes → re-map
-            if self._apply_rotation_aug:
-                theta_cd = np.arccos(np.clip(cd_unit[:, 2], -1.0, 1.0))
-                phi_cd = np.arctan2(cd_unit[:, 1], cd_unit[:, 0]) % (2 * np.pi)
-                pixel_ids = hp.ang2pix(self.healpix.nside, theta_cd, phi_cd, nest=False)
-            else:
-                pixel_ids = self.healpix.lookup(cd_copyno)  # (N_cd,)
-
-            # Build dense HEALPix grid (fixed shape: npix)
-            cd_patch_unit, cd_stats, cd_time_bins, cd_mask_dense, cd_patch_t_mean = build_dense_cd_patches(
-                pixel_ids=pixel_ids,
-                cd_unit_vecs_hits=cd_unit.astype(np.float32),
-                cd_times=norm_cd_t,
-                cd_charges=norm_cd_q,
-                pixel_center_vecs=self.healpix.cd_unit_vecs,  # (npix, 3)
-                npix=npix,
-                num_time_bins=self.num_time_bins,
+            cd_tokens_np, cd_mask_np = build_v3_cd_tokens(
+                cd_copyno=cd_copyno,
+                cd_unit_vecs=cd_unit,
+                cd_charges=cd_charge,      # raw charge
+                cd_times=cd_time,          # raw time
+                geometry=self.geo,
                 t_max=self.t_max,
+                K_cd=self.K_cd,
             )
         else:
-            # No CD hits: return empty dense grid (all masked)
-            cd_patch_unit = self.healpix.cd_unit_vecs.astype(np.float32).copy()
-            cd_stats = np.zeros((npix, 4), dtype=np.float32)
-            cd_time_bins = np.zeros((npix, self.num_time_bins), dtype=np.float32)
-            cd_mask_dense = np.ones((npix,), dtype=bool)
+            cd_tokens_np = np.zeros((self.K_cd, 10), dtype=np.float32)
+            cd_mask_np = np.ones(self.K_cd, dtype=bool)
 
-        # Fixed shape for Stage B: (npix, ...)
-        n_patches = npix
-        cd_patch_t_mean = cd_stats[:, 3]  # t_mean is 4th column
-
-        # Convert to tensors
-        # Note: cd_pixel_ids is deprecated in Stage B (fixed grid, index = pixel id)
-        cd_pixel_ids = torch.arange(npix, dtype=torch.int64)  # 0, 1, ..., npix-1
-
-        # Stage B: CD uses fixed dense HEALPix grid representation
-        # Shape is now fixed (npix, ...) instead of variable (N_active_patches, ...)
         result = {
             'wp_tokens': torch.from_numpy(wp_tokens),           # (N_wp, 5)
             'wp_mask': torch.zeros(N_wp, dtype=torch.bool),     # False = valid
             'wp_unit_vecs': torch.from_numpy(wp_unit.astype(np.float32)),  # (N_wp, 3)
             'wp_times': torch.from_numpy(norm_wp_t.astype(np.float32)),    # (N_wp,)
-            # Stage B: CD uses fixed dense HEALPix grid (npix = 12 * nside^2)
-            'cd_unit_vecs': torch.from_numpy(cd_patch_unit),    # (npix, 3)
-            'cd_stats': torch.from_numpy(cd_stats),             # (npix, 4)
-            'cd_time_bins': torch.from_numpy(cd_time_bins),     # (npix, B_bins)
-            'cd_mask': torch.from_numpy(cd_mask_dense),         # (npix,) True = inactive/no hits
-            'cd_times_mean': torch.from_numpy(cd_patch_t_mean),  # (npix,)
-            # DEPRECATED in Stage B: kept for compatibility, use index as pixel id
-            'cd_pixel_ids': cd_pixel_ids,                        # (npix,) = [0, 1, ..., npix-1]
+            # v3: CD sparse PMT tokens
+            'cd_tokens': torch.from_numpy(cd_tokens_np),        # (K_cd, 10)
+            'cd_mask': torch.from_numpy(cd_mask_np),            # (K_cd,) True = padding
             'u1': torch.from_numpy(u1),                          # (3,)
             'u2': torch.from_numpy(u2),                          # (3,)
             'p1': torch.from_numpy(enter),                       # (3,) raw xyz
@@ -431,12 +474,10 @@ class H5EndpointDataset(Dataset):
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     Custom collate: pad variable-length WP tokens to batch max.
-    CD uses fixed dense HEALPix grid — no padding needed, just stack.
+    CD uses fixed-shape sparse PMT tokens — just stack.
     """
     max_wp = max(b['wp_tokens'].shape[0] for b in batch)
     B = len(batch)
-    npix = batch[0]['cd_unit_vecs'].shape[0]  # Fixed: 12 * nside^2
-    num_time_bins = batch[0]['cd_time_bins'].shape[1] if batch[0]['cd_time_bins'].dim() > 1 else 0
 
     # WP: variable length, needs padding
     wp_tokens = torch.zeros(B, max_wp, 5)
@@ -444,11 +485,9 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     wp_unit_vecs = torch.zeros(B, max_wp, 3)
     wp_times = torch.zeros(B, max_wp)
 
-    # CD: fixed shape, just stack. cd_unit_vecs is shared across all events.
-    cd_unit_vecs = batch[0]['cd_unit_vecs'].unsqueeze(0).expand(B, -1, -1).clone()
-    cd_stats = torch.zeros(B, npix, 4)
-    cd_time_bins = torch.zeros(B, npix, num_time_bins)
-    cd_mask = torch.ones(B, npix, dtype=torch.bool)
+    # CD: fixed-shape (K_cd, 10), just stack
+    cd_tokens = torch.stack([b['cd_tokens'] for b in batch])   # (B, K_cd, 10)
+    cd_mask = torch.stack([b['cd_mask'] for b in batch])       # (B, K_cd)
 
     u1 = torch.zeros(B, 3)
     u2 = torch.zeros(B, 3)
@@ -464,10 +503,6 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             wp_unit_vecs[i, :n_wp] = b['wp_unit_vecs']
             wp_times[i, :n_wp] = b['wp_times']
 
-        cd_stats[i] = b['cd_stats']
-        cd_time_bins[i] = b['cd_time_bins']
-        cd_mask[i] = b['cd_mask']
-
         u1[i] = b['u1']
         u2[i] = b['u2']
         p1[i] = b['p1']
@@ -478,9 +513,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         'wp_mask': wp_mask,
         'wp_unit_vecs': wp_unit_vecs,
         'wp_times': wp_times,
-        'cd_unit_vecs': cd_unit_vecs,
-        'cd_stats': cd_stats,
-        'cd_time_bins': cd_time_bins,
+        'cd_tokens': cd_tokens,
         'cd_mask': cd_mask,
         'u1': u1,
         'u2': u2,
@@ -489,17 +522,12 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     }
 
 
-def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,
-                       healpix: HEALPixMapper) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def create_dataloaders(config: dict, geometry: DualPMTPositionLookup
+                       ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train/val/test DataLoaders from config.
 
     Auto-detects preprocessed data if available, otherwise uses raw H5 files.
-
-    Supports h5_path as:
-    - Single file path
-    - Directory (auto-discover *.h5)
-    - Glob pattern (e.g. "/path/run_*.h5")
 
     Returns:
         (train_loader, val_loader, test_loader)
@@ -563,11 +591,11 @@ def create_dataloaders(config: dict, geometry: DualPMTPositionLookup,
 
     batch_size = config['train']['batch_size']
 
-    train_ds = H5EndpointDataset(h5_files, config, geometry, healpix, train_idx,
+    train_ds = H5EndpointDataset(h5_files, config, geometry, train_idx,
                                   is_train=True, events_per_file=events_per_file)
-    val_ds = H5EndpointDataset(h5_files, config, geometry, healpix, val_idx,
+    val_ds = H5EndpointDataset(h5_files, config, geometry, val_idx,
                                 is_train=False, events_per_file=events_per_file)
-    test_ds = H5EndpointDataset(h5_files, config, geometry, healpix, test_idx,
+    test_ds = H5EndpointDataset(h5_files, config, geometry, test_idx,
                                  is_train=False, events_per_file=events_per_file)
 
     # Disable num_workers when using accelerate to avoid fork/deadlock issues

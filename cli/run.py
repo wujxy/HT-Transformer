@@ -65,7 +65,6 @@ def main():
         from metrics.endpoint_metrics import evaluate_model, format_metrics, compute_endpoint_metrics
         from visualization.plotting import plot_training_curves, plot_result_distributions, plot_event_3d
         from geometry.detector_geometry import DualPMTPositionLookup
-        from geometry.healpix_mapper import HEALPixMapper
         from data.dataset import create_dataloaders
         from models.ht_transformer import HTTransformer
         import torch
@@ -87,15 +86,8 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         geometry = DualPMTPositionLookup(
             config['data']['geometry_cd'], config['data']['geometry_wp'])
-        cd_unit_vecs = geometry.cd_position_array.copy()
-        norms = np.linalg.norm(cd_unit_vecs, axis=1, keepdims=True)
-        valid = (norms.squeeze() > 0)
-        cd_unit_vecs[valid] = cd_unit_vecs[valid] / np.linalg.norm(cd_unit_vecs[valid], axis=1, keepdims=True)
 
-        healpix = HEALPixMapper(nside=config['data']['nside'], cd_unit_vecs=cd_unit_vecs)
-        healpix.build_knn_adjacency(k=config['model']['cd_knn_k'])
-
-        _, _, test_loader = create_dataloaders(config, geometry, healpix)
+        _, _, test_loader = create_dataloaders(config, geometry)
 
         # Load model
         model = HTTransformer(config).to(device)
