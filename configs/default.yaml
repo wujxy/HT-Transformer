@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3_rotation_1time"
+mission_name: "ht_transformer_v3_test"
 output_path: "output"
 detector_type: "CDWP"
 

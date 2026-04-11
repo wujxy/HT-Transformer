@@ -860,6 +860,27 @@ class Trainer:
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
             epochs = range(1, len(self.history['train_loss']) + 1)
+            n_recent = 5  # number of recent epochs for inset
+
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+            def _add_recent_inset(ax, train_data, val_data, epochs_list, n):
+                """Add a small inset showing the most recent n epochs."""
+                total = len(train_data)
+                if total < n + 1:
+                    return
+                recent_slice = slice(total - n, total)
+                recent_epochs = list(epochs_list)[recent_slice]
+                recent_train = train_data[recent_slice]
+                recent_val = val_data[recent_slice]
+
+                ins = inset_axes(ax, width="35%", height="35%", loc="center right",
+                                 borderpad=1.5)
+                ins.plot(recent_epochs, recent_train, 'o-', markersize=2, linewidth=1)
+                ins.plot(recent_epochs, recent_val, 's-', markersize=2, linewidth=1)
+                ins.set_title(f'Last {n}', fontsize=7, pad=2)
+                ins.tick_params(labelsize=6)
+                ins.grid(True, alpha=0.3)
 
             # Total loss
             axes[0, 0].plot(epochs, self.history['train_loss'], label='Train')
@@ -867,23 +888,31 @@ class Trainer:
             axes[0, 0].set_title('Total Loss')
             axes[0, 0].legend()
             axes[0, 0].set_xlabel('Epoch')
+            _add_recent_inset(axes[0, 0], self.history['train_loss'],
+                              self.history['val_loss'], epochs, n_recent)
 
             # Angle loss
             axes[0, 1].plot(epochs, self.history['train_ang'], label='Train')
             axes[0, 1].plot(epochs, self.history['val_ang'], label='Val')
             axes[0, 1].set_title('Angle Loss')
             axes[0, 1].legend()
+            _add_recent_inset(axes[0, 1], self.history['train_ang'],
+                              self.history['val_ang'], epochs, n_recent)
 
             # Length + Dir loss
             axes[1, 0].plot(epochs, self.history['train_len'], label='Len(train)')
             axes[1, 0].plot(epochs, self.history['val_len'], label='Len(val)')
             axes[1, 0].set_title('Length Loss')
             axes[1, 0].legend()
+            _add_recent_inset(axes[1, 0], self.history['train_len'],
+                              self.history['val_len'], epochs, n_recent)
 
             axes[1, 1].plot(epochs, self.history['train_dir'], label='Dir(train)')
             axes[1, 1].plot(epochs, self.history['val_dir'], label='Dir(val)')
             axes[1, 1].set_title('Direction Loss')
             axes[1, 1].legend()
+            _add_recent_inset(axes[1, 1], self.history['train_dir'],
+                              self.history['val_dir'], epochs, n_recent)
 
             # Reconstruction metric trends (row 3)
             if has_recon:
