@@ -7,9 +7,11 @@ Follows reference project ModelTrain.py framework style.
 import os
 import time
 import json
+import yaml
 import numpy as np
 import torch
 import torch.nn as nn
+from datetime import datetime
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from loguru import logger
@@ -255,6 +257,8 @@ class Trainer:
 
         if self._is_main:
             self._log_model_summary()
+            self._save_config()
+            self._save_model_summary()
 
         # Loss
         self.criterion = EndpointLoss(
@@ -325,8 +329,8 @@ class Trainer:
                     self.train_loader, self.val_loader, self.test_loader)
             logger.info("accelerator.prepare() done for model, optimizer, dataloaders")
 
-    def _log_model_summary(self):
-        """Log model architecture summary with parameter breakdown."""
+    def _build_summary_lines(self) -> list:
+        """Build model architecture summary lines (shared by logging and file saving)."""
         m = self.model
         mc = self.model_cfg
         dc = self.data_cfg
@@ -385,8 +389,52 @@ class Trainer:
         lines.append(f"    {'Total            '}: {total:>10,}")
         lines.append(sep)
 
-        for line in lines:
+        return lines
+
+    def _log_model_summary(self):
+        """Log model architecture summary with parameter breakdown."""
+        for line in self._build_summary_lines():
             logger.info(line)
+
+    def _save_model_summary(self):
+        """Save model architecture summary to output_dir/model_summary.txt."""
+        lines = self._build_summary_lines()
+        path = os.path.join(self.output_dir, 'model_summary.txt')
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        logger.info(f"Model summary saved: {path}")
+
+    def _save_config(self):
+        """Save full config (including CLI overrides) to output_dir/config.yaml."""
+        def make_serializable(obj):
+            """Recursively convert non-serializable types for YAML dump."""
+            if isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [make_serializable(v) for v in obj]
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().tolist()
+            if isinstance(obj, (bool, int, float, str)):
+                return obj
+            return str(obj)
+
+        path = os.path.join(self.output_dir, 'config.yaml')
+        header = (
+            f"# HT-Transformer Training Configuration\n"
+            f"# Mission: {self.cfg.get('mission_name', 'N/A')}\n"
+            f"# Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        )
+        with open(path, 'w') as f:
+            f.write(header)
+            yaml.dump(make_serializable(self.cfg), f,
+                      default_flow_style=False, allow_unicode=True, sort_keys=False)
+        logger.info(f"Config saved: {path}")
 
     def _verify_gradient_flow(self):
         """Verify that all model parameters receive gradients during backward pass."""
