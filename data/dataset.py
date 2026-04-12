@@ -110,13 +110,6 @@ def aggregate_cd_hits_by_pmt(
     # [9] t_span
     features[:, 9] = features[:, 8] - features[:, 6]
 
-    # --- Filter outlier PMTs (q_sum > p99) ---
-    # Remove PMTs with abnormally high charge (likely detector artifacts)
-    if n_pmts > 10:
-        q_p99 = np.percentile(features[:, 3], 99)
-        keep = features[:, 3] <= q_p99
-        features = features[keep]
-
     # --- Normalize scalar features ---
     # q_sum, q_max: log10(x+1) → clip p99 → min-max [0,1]
     for col in [3, 4]:

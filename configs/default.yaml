@@ -74,8 +74,11 @@ model:
   norm_type: "rmsnorm"
 
 loss:
-  lambda_len: 0.5
-  lambda_dir: 0.5
+  name: "endpoint_composite"
+  lambda_ep: 1.0
+  lambda_mid: 0.5
+  lambda_dir: 0.25
+  lambda_len: 0.05
 
 train:
   optimizer: "adamw"
@@ -88,13 +91,13 @@ train:
   plateau_threshold: 1.0e-3
   plateau_min_lr: 1.0e-6
   early_stop_patience: 4
-  early_stop_monitor: "val_dir_ang_p68"
+  early_stop_monitor: "val_mean_ep_ang_p68"
   early_stop_mode: "min"
   precision: "bf16"
   dropout: 0.1
   grad_clip: 1.0
   batch_size: 64
-  num_epochs: 100
+  num_epochs: 50
   save_every: 50
   eval_every: 5
   use_accelerate: true

@@ -113,6 +113,14 @@ def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
     gt_mid = (gt_u1 + gt_u2) / 2.0 * sphere_radius
     midpoint_dist = np.linalg.norm(pred_mid - gt_mid, axis=-1)
 
+    # --- Mean endpoint angle ---
+    mean_ep_angle = 0.5 * (ep1_angle + ep2_angle)
+
+    # --- Midpoint distance on unit sphere ---
+    pred_mid_unit = (pred_u1 + pred_u2) / 2.0
+    gt_mid_unit = (gt_u1 + gt_u2) / 2.0
+    midpoint_dist_unit = np.linalg.norm(pred_mid_unit - gt_mid_unit, axis=-1)
+
     # --- Quantile summaries ---
     def _quantile_summary(arr, prefix):
         return {
@@ -130,13 +138,17 @@ def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
         'n_events': len(pred_u1),
         'dir_angle': dir_angle,
         'midpoint_dist': midpoint_dist,
+        'midpoint_dist_unit': midpoint_dist_unit,
         'ep1_angle': ep1_angle,
         'ep2_angle': ep2_angle,
+        'mean_ep_angle': mean_ep_angle,
     }
     result.update(_quantile_summary(dir_angle, 'dir_ang'))
     result.update(_quantile_summary(midpoint_dist, 'mid_dist'))
+    result.update(_quantile_summary(midpoint_dist_unit, 'mid_dist_unit'))
     result.update(_quantile_summary(ep1_angle, 'ep1_ang'))
     result.update(_quantile_summary(ep2_angle, 'ep2_ang'))
+    result.update(_quantile_summary(mean_ep_angle, 'mean_ep_ang'))
 
     return result
 

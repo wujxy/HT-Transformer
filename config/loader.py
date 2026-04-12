@@ -169,7 +169,13 @@ def _default_config() -> dict:
             # Global normalization
             'norm_type': 'rmsnorm',
         },
-        'loss': {'lambda_len': 0.5, 'lambda_dir': 0.25},
+        'loss': {
+            'name': 'endpoint_composite',
+            'lambda_ep': 1.0,
+            'lambda_mid': 0.5,
+            'lambda_dir': 0.25,
+            'lambda_len': 0.05,
+        },
         'train': {
             'optimizer': 'adamw', 'lr': 3e-4, 'weight_decay': 1e-2,
             # Warmup + ReduceLROnPlateau scheduler
@@ -180,7 +186,7 @@ def _default_config() -> dict:
             'plateau_min_lr': 1e-6,   # Minimum learning rate
             # Early stopping
             'early_stop_patience': 8,
-            'early_stop_monitor': 'val_dir_ang_p68',  # Metric to monitor
+            'early_stop_monitor': 'val_mean_ep_ang_p68',  # Endpoint angle metric
             'early_stop_mode': 'min',
             # Training settings
             'precision': 'bf16', 'dropout': 0.1, 'grad_clip': 1.0,
