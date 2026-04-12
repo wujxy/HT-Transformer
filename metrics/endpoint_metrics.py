@@ -183,7 +183,6 @@ def evaluate_model(model, dataloader, device, config) -> Dict:
 
     model.eval()
     criterion = EndpointLoss(
-        lambda_ang=config['loss']['lambda_ang'],
         lambda_len=config['loss']['lambda_len'],
         lambda_dir=config['loss']['lambda_dir'],
     )

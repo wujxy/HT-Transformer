@@ -167,6 +167,75 @@ def _append_to_split_hdf5(h5_path, tokenized_events, K_cd):
         f.create_dataset('wp_offsets', data=merged, dtype='int64')
 
 
+def _plot_track_angle_distribution(preprocessed_dir: str):
+    """Plot track direction distribution for train/val/test splits.
+
+    Two subplots:
+      - cos(phi): cosine of polar angle w.r.t. z-axis, uniform in [-1, 1]
+      - theta: azimuthal angle in [0, 2*pi]
+    Verifies rotation augmentation produces uniform track direction distribution.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available, skipping track angle distribution plot")
+        return
+
+    eps = 1e-10
+    splits = {}
+    for split_name in ['train', 'val', 'test']:
+        h5_path = os.path.join(preprocessed_dir, f'{split_name}.h5')
+        if not os.path.exists(h5_path):
+            continue
+        with h5py.File(h5_path, 'r') as f:
+            labels = f['labels'][:]  # (N, 12): [u1(3), u2(3), p1(3), p2(3)]
+        u1 = labels[:, :3]
+        u2 = labels[:, 3:6]
+        d = u2 - u1
+        d_norm = np.linalg.norm(d, axis=-1, keepdims=True)
+        d = d / (d_norm + eps)
+        cos_phi = d[:, 2]                                  # cos(polar angle)
+        theta = np.arctan2(d[:, 1], d[:, 0]) % (2 * np.pi)  # azimuthal angle [0, 2pi]
+        splits[split_name] = (cos_phi, theta)
+
+    if not splits:
+        logger.warning("No split files found for track angle distribution plot")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # cos(phi) distribution: should be flat in [-1, 1]
+    ax = axes[0]
+    bins_cos = np.linspace(-1, 1, 41)
+    for split_name, (cos_phi, _) in splits.items():
+        ax.hist(cos_phi, bins=bins_cos, alpha=0.5,
+                label=f'{split_name} (N={len(cos_phi)})', density=True)
+    ax.set_xlabel('cos(φ)  [polar angle w.r.t. z-axis]')
+    ax.set_ylabel('Normalized count')
+    ax.set_title('cos(φ) Distribution')
+    ax.legend()
+
+    # theta distribution: should be flat in [0, 2pi]
+    ax = axes[1]
+    bins_theta = np.linspace(0, 2 * np.pi, 37)
+    for split_name, (_, theta) in splits.items():
+        ax.hist(theta, bins=bins_theta, alpha=0.5,
+                label=f'{split_name} (N={len(theta)})', density=True)
+    ax.set_xlabel('θ  [azimuthal angle, rad]')
+    ax.set_ylabel('Normalized count')
+    ax.set_title('θ Distribution')
+    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
+    ax.set_xticklabels(['0', 'π/2', 'π', '3π/2', '2π'])
+    ax.legend()
+
+    path = os.path.join(preprocessed_dir, 'track_angle_distribution.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Track angle distribution plot saved: {path}")
+
+
 # ---------------------------------------------------------------------------
 # Preprocessing entry point
 # ---------------------------------------------------------------------------
@@ -273,9 +342,14 @@ def preprocess(config: dict):
         logger.info(f"  {split_name}: {n} events → {h5_path}")
         return n
 
-    # Write train (original only first) — skip if already done
+    # Write train — skip if already done
+    # When expand_times >= 1: only tokenize rotated samples (skip biased originals)
+    # When expand_times == 0: tokenize original samples (no augmentation)
     train_h5_path = os.path.join(preprocessed_dir, 'train.h5')
-    expected_train_total = len(train_idx) * (1 + expand_times)
+    if expand_times >= 1:
+        expected_train_total = len(train_idx) * expand_times
+    else:
+        expected_train_total = len(train_idx)
     skip_train = False
 
     if os.path.exists(train_h5_path):
@@ -289,18 +363,57 @@ def preprocess(config: dict):
             logger.warning(f"train.h5 exists but has {existing_n} events (expected {expected_train_total}), re-processing train")
 
     if not skip_train:
-        n_train_total = _tokenize_and_write(
-            'train', [train_idx],
-            train_h5_path,
+        if expand_times == 0:
+            # No augmentation: tokenize original samples
+            n_train_total = _tokenize_and_write(
+                'train', [train_idx],
+                train_h5_path,
+                apply_rotation=False,
+            )
+        else:
+            # With augmentation: only tokenize rotated samples (skip biased originals)
+            n_train_total = 0
+            for exp in range(expand_times):
+                logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
+                aug_events = []
+                ds = H5EndpointDataset(
+                    h5_files, config, geometry,
+                    indices=train_idx, is_train=False,
+                    events_per_file=events_per_file,
+                    apply_rotation_aug=True,
+                )
+                loader = DataLoader(
+                    ds, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, collate_fn=_identity_collate,
+                    pin_memory=False, prefetch_factor=prefetch,
+                    persistent_workers=False,
+                )
+                for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
+                    aug_events.extend(batch_data)
+
+                if exp == 0:
+                    n_train_total = _write_split_hdf5(train_h5_path, aug_events, K_cd)
+                else:
+                    _append_to_split_hdf5(train_h5_path, aug_events, K_cd)
+                    n_train_total += len(aug_events)
+            logger.info(f"  train (rotation only): {n_train_total} events")
+
+    # --- Val: same pattern as train ---
+    val_h5_path = os.path.join(preprocessed_dir, 'val.h5')
+    if expand_times == 0:
+        n_val_total = _tokenize_and_write(
+            'val', [val_idx],
+            val_h5_path,
             apply_rotation=False,
         )
-        # Append rotation-augmented copies to train.h5
+    else:
+        n_val_total = 0
         for exp in range(expand_times):
-            logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
+            logger.info(f"Val rotation augmentation {exp+1}/{expand_times}...")
             aug_events = []
             ds = H5EndpointDataset(
                 h5_files, config, geometry,
-                indices=train_idx, is_train=False,
+                indices=val_idx, is_train=False,
                 events_per_file=events_per_file,
                 apply_rotation_aug=True,
             )
@@ -310,71 +423,48 @@ def preprocess(config: dict):
                 pin_memory=False, prefetch_factor=prefetch,
                 persistent_workers=False,
             )
-            for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
+            for batch_data in tqdm(loader, desc=f"Val rotation {exp+1}/{expand_times}"):
                 aug_events.extend(batch_data)
+            if exp == 0:
+                n_val_total = _write_split_hdf5(val_h5_path, aug_events, K_cd)
+            else:
+                _append_to_split_hdf5(val_h5_path, aug_events, K_cd)
+                n_val_total += len(aug_events)
+        logger.info(f"  val (rotation only): {n_val_total} events")
 
-            _append_to_split_hdf5(train_h5_path, aug_events, K_cd)
-            n_train_total += len(aug_events)
-        if expand_times > 0:
-            logger.info(f"  train (with aug): {n_train_total} events")
-
-    # --- Val: original + rotation copies (same pattern as train) ---
-    val_h5_path = os.path.join(preprocessed_dir, 'val.h5')
-    n_val_total = _tokenize_and_write(
-        'val', [val_idx],
-        val_h5_path,
-        apply_rotation=False,
-    )
-    for exp in range(expand_times):
-        logger.info(f"Val rotation augmentation {exp+1}/{expand_times}...")
-        aug_events = []
-        ds = H5EndpointDataset(
-            h5_files, config, geometry,
-            indices=val_idx, is_train=False,
-            events_per_file=events_per_file,
-            apply_rotation_aug=True,
-        )
-        loader = DataLoader(
-            ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, collate_fn=_identity_collate,
-            pin_memory=False, prefetch_factor=prefetch,
-            persistent_workers=False,
-        )
-        for batch_data in tqdm(loader, desc=f"Val rotation {exp+1}/{expand_times}"):
-            aug_events.extend(batch_data)
-        _append_to_split_hdf5(val_h5_path, aug_events, K_cd)
-        n_val_total += len(aug_events)
-    if expand_times > 0:
-        logger.info(f"  val (with aug): {n_val_total} events")
-
-    # --- Test: original + rotation copies (same pattern as train) ---
+    # --- Test: same pattern as train ---
     test_h5_path = os.path.join(preprocessed_dir, 'test.h5')
-    n_test_total = _tokenize_and_write(
-        'test', [test_idx],
-        test_h5_path,
-        apply_rotation=False,
-    )
-    for exp in range(expand_times):
-        logger.info(f"Test rotation augmentation {exp+1}/{expand_times}...")
-        aug_events = []
-        ds = H5EndpointDataset(
-            h5_files, config, geometry,
-            indices=test_idx, is_train=False,
-            events_per_file=events_per_file,
-            apply_rotation_aug=True,
+    if expand_times == 0:
+        n_test_total = _tokenize_and_write(
+            'test', [test_idx],
+            test_h5_path,
+            apply_rotation=False,
         )
-        loader = DataLoader(
-            ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, collate_fn=_identity_collate,
-            pin_memory=False, prefetch_factor=prefetch,
-            persistent_workers=False,
-        )
-        for batch_data in tqdm(loader, desc=f"Test rotation {exp+1}/{expand_times}"):
-            aug_events.extend(batch_data)
-        _append_to_split_hdf5(test_h5_path, aug_events, K_cd)
-        n_test_total += len(aug_events)
-    if expand_times > 0:
-        logger.info(f"  test (with aug): {n_test_total} events")
+    else:
+        n_test_total = 0
+        for exp in range(expand_times):
+            logger.info(f"Test rotation augmentation {exp+1}/{expand_times}...")
+            aug_events = []
+            ds = H5EndpointDataset(
+                h5_files, config, geometry,
+                indices=test_idx, is_train=False,
+                events_per_file=events_per_file,
+                apply_rotation_aug=True,
+            )
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, collate_fn=_identity_collate,
+                pin_memory=False, prefetch_factor=prefetch,
+                persistent_workers=False,
+            )
+            for batch_data in tqdm(loader, desc=f"Test rotation {exp+1}/{expand_times}"):
+                aug_events.extend(batch_data)
+            if exp == 0:
+                n_test_total = _write_split_hdf5(test_h5_path, aug_events, K_cd)
+            else:
+                _append_to_split_hdf5(test_h5_path, aug_events, K_cd)
+                n_test_total += len(aug_events)
+        logger.info(f"  test (rotation only): {n_test_total} events")
 
     # --- Save metadata ---
     meta = {
@@ -399,6 +489,9 @@ def preprocess(config: dict):
 
     logger.info(f"Preprocessing complete: {preprocessed_dir}")
     logger.info(f"  train={n_train_total}, val={n_val_total}, test={n_test_total}")
+
+    # --- Plot track angle distribution for uniformity verification ---
+    _plot_track_angle_distribution(preprocessed_dir)
 
 
 # ---------------------------------------------------------------------------

@@ -169,7 +169,7 @@ def _default_config() -> dict:
             # Global normalization
             'norm_type': 'rmsnorm',
         },
-        'loss': {'lambda_ang': 1.0, 'lambda_len': 0.5, 'lambda_dir': 0.25},
+        'loss': {'lambda_len': 0.5, 'lambda_dir': 0.25},
         'train': {
             'optimizer': 'adamw', 'lr': 3e-4, 'weight_decay': 1e-2,
             # Warmup + ReduceLROnPlateau scheduler

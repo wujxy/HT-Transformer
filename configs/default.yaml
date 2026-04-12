@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3"
+mission_name: "ht_transformer_v3_rotation_2times"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -74,9 +74,8 @@ model:
   norm_type: "rmsnorm"
 
 loss:
-  lambda_ang: 1.0
   lambda_len: 0.5
-  lambda_dir: 0.25
+  lambda_dir: 0.5
 
 train:
   optimizer: "adamw"
@@ -103,7 +102,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 0
+  rotation_expand_times: 2
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false

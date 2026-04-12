@@ -262,7 +262,6 @@ class Trainer:
 
         # Loss
         self.criterion = EndpointLoss(
-            lambda_ang=self.loss_cfg['lambda_ang'],
             lambda_len=self.loss_cfg['lambda_len'],
             lambda_dir=self.loss_cfg['lambda_dir'],
         )
@@ -313,8 +312,8 @@ class Trainer:
         # Training state
         self.history = {
             'train_loss': [], 'val_loss': [],
-            'train_ang': [], 'train_len': [], 'train_dir': [],
-            'val_ang': [], 'val_len': [], 'val_dir': [],
+            'train_len': [], 'train_dir': [],
+            'val_len': [], 'val_dir': [],
             'lr': [],
         }
         self.best_val_loss = float('inf')
@@ -507,10 +506,8 @@ class Trainer:
             if self._is_main:
                 self.history['train_loss'].append(train_metrics['loss_total'])
                 self.history['val_loss'].append(val_metrics['loss_total'])
-                self.history['train_ang'].append(train_metrics['loss_ang'])
                 self.history['train_len'].append(train_metrics['loss_len'])
                 self.history['train_dir'].append(train_metrics['loss_dir'])
-                self.history['val_ang'].append(val_metrics['loss_ang'])
                 self.history['val_len'].append(val_metrics['loss_len'])
                 self.history['val_dir'].append(val_metrics['loss_dir'])
                 self.history['lr'].append(lr)
@@ -523,7 +520,7 @@ class Trainer:
                 logger.info(
                     f"Epoch [{epoch+1}/{num_epochs}] "
                     f"Train loss: {train_metrics['loss_total']:.4f} "
-                    f"(ang={train_metrics['loss_ang']:.4f} len={train_metrics['loss_len']:.4f} "
+                    f"(len={train_metrics['loss_len']:.4f} "
                     f"dir={train_metrics['loss_dir']:.4f}) "
                     f"Val loss: {val_metrics['loss_total']:.4f} "
                     f"LR: {lr:.6f}{scheduler_status} "
@@ -599,7 +596,6 @@ class Trainer:
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
         total_loss = 0
-        total_ang = 0
         total_len = 0
         total_dir = 0
         n_batches = 0
@@ -659,7 +655,6 @@ class Trainer:
                 t3 = time.time()
 
             total_loss += loss_dict['loss_total']
-            total_ang += loss_dict['loss_ang']
             total_len += loss_dict['loss_len']
             total_dir += loss_dict['loss_dir']
             n_batches += 1
@@ -678,7 +673,7 @@ class Trainer:
                     pbar.write(f"[prof] h2d={dt_h2d:.0f}ms  fwd={dt_fwd:.0f}ms  "
                                f"bwd={dt_bwd:.0f}ms  loss={loss_dict['loss_total']:.4f}")
                 pbar.set_postfix(loss=f"{loss_dict['loss_total']:.4f}",
-                                 ang=f"{loss_dict['loss_ang']:.4f}")
+                                 dir=f"{loss_dict['loss_dir']:.4f}")
 
         if self._is_main and n_batches > 0:
             logger.info(
@@ -691,7 +686,6 @@ class Trainer:
 
         return {
             'loss_total': total_loss / max(1, n_batches),
-            'loss_ang': total_ang / max(1, n_batches),
             'loss_len': total_len / max(1, n_batches),
             'loss_dir': total_dir / max(1, n_batches),
         }
@@ -700,7 +694,6 @@ class Trainer:
     def _val_epoch(self) -> dict:
         self.model.eval()
         total_loss = 0.0
-        total_ang = 0.0
         total_len = 0.0
         total_dir = 0.0
         n_batches = 0
@@ -723,7 +716,6 @@ class Trainer:
             )
 
             total_loss += loss_dict['loss_total']
-            total_ang += loss_dict['loss_ang']
             total_len += loss_dict['loss_len']
             total_dir += loss_dict['loss_dir']
             n_batches += 1
@@ -735,20 +727,17 @@ class Trainer:
             # Gather loss sums across GPUs
             device = self.accelerator.device
             gathered_loss = self.accelerator.gather(torch.tensor(total_loss, device=device))
-            gathered_ang = self.accelerator.gather(torch.tensor(total_ang, device=device))
             gathered_len = self.accelerator.gather(torch.tensor(total_len, device=device))
             gathered_dir = self.accelerator.gather(torch.tensor(total_dir, device=device))
             gathered_n = self.accelerator.gather(torch.tensor(n_batches, device=device))
             return {
                 'loss_total': gathered_loss.sum().item() / max(1, gathered_n.sum().item()),
-                'loss_ang': gathered_ang.sum().item() / max(1, gathered_n.sum().item()),
                 'loss_len': gathered_len.sum().item() / max(1, gathered_n.sum().item()),
                 'loss_dir': gathered_dir.sum().item() / max(1, gathered_n.sum().item()),
             }
         else:
             return {
                 'loss_total': total_loss / max(1, n_batches),
-                'loss_ang': total_ang / max(1, n_batches),
                 'loss_len': total_len / max(1, n_batches),
                 'loss_dir': total_dir / max(1, n_batches),
             }
@@ -855,9 +844,9 @@ class Trainer:
             has_recon = 'val_dir_ang_p68' in self.history and len(self.history['val_dir_ang_p68']) > 0
 
             if has_recon:
-                fig, axes = plt.subplots(3, 2, figsize=(12, 15))
-            else:
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            else:
+                fig, axes = plt.subplots(3, 1, figsize=(12, 12))
 
             epochs = range(1, len(self.history['train_loss']) + 1)
             n_recent = 5  # number of recent epochs for inset
@@ -882,56 +871,50 @@ class Trainer:
                 ins.tick_params(labelsize=6)
                 ins.grid(True, alpha=0.3)
 
+            # Determine axes references based on layout
+            if has_recon:
+                ax_total, ax_len, ax_dir = axes[0, 0], axes[0, 1], axes[1, 0]
+                ax_recon1 = axes[1, 1]
+            else:
+                ax_total, ax_len, ax_dir = axes[0], axes[1], axes[2]
+
             # Total loss
-            axes[0, 0].plot(epochs, self.history['train_loss'], label='Train')
-            axes[0, 0].plot(epochs, self.history['val_loss'], label='Val')
-            axes[0, 0].set_title('Total Loss')
-            axes[0, 0].legend()
-            axes[0, 0].set_xlabel('Epoch')
-            _add_recent_inset(axes[0, 0], self.history['train_loss'],
+            ax_total.plot(epochs, self.history['train_loss'], label='Train')
+            ax_total.plot(epochs, self.history['val_loss'], label='Val')
+            ax_total.set_title('Total Loss')
+            ax_total.legend()
+            ax_total.set_xlabel('Epoch')
+            _add_recent_inset(ax_total, self.history['train_loss'],
                               self.history['val_loss'], epochs, n_recent)
 
-            # Angle loss
-            axes[0, 1].plot(epochs, self.history['train_ang'], label='Train')
-            axes[0, 1].plot(epochs, self.history['val_ang'], label='Val')
-            axes[0, 1].set_title('Angle Loss')
-            axes[0, 1].legend()
-            _add_recent_inset(axes[0, 1], self.history['train_ang'],
-                              self.history['val_ang'], epochs, n_recent)
-
-            # Length + Dir loss
-            axes[1, 0].plot(epochs, self.history['train_len'], label='Len(train)')
-            axes[1, 0].plot(epochs, self.history['val_len'], label='Len(val)')
-            axes[1, 0].set_title('Length Loss')
-            axes[1, 0].legend()
-            _add_recent_inset(axes[1, 0], self.history['train_len'],
+            # Length loss
+            ax_len.plot(epochs, self.history['train_len'], label='Len(train)')
+            ax_len.plot(epochs, self.history['val_len'], label='Len(val)')
+            ax_len.set_title('Length Loss')
+            ax_len.legend()
+            ax_len.set_xlabel('Epoch')
+            _add_recent_inset(ax_len, self.history['train_len'],
                               self.history['val_len'], epochs, n_recent)
 
-            axes[1, 1].plot(epochs, self.history['train_dir'], label='Dir(train)')
-            axes[1, 1].plot(epochs, self.history['val_dir'], label='Dir(val)')
-            axes[1, 1].set_title('Direction Loss')
-            axes[1, 1].legend()
-            _add_recent_inset(axes[1, 1], self.history['train_dir'],
+            # Direction loss
+            ax_dir.plot(epochs, self.history['train_dir'], label='Dir(train)')
+            ax_dir.plot(epochs, self.history['val_dir'], label='Dir(val)')
+            ax_dir.set_title('Direction Loss')
+            ax_dir.legend()
+            ax_dir.set_xlabel('Epoch')
+            _add_recent_inset(ax_dir, self.history['train_dir'],
                               self.history['val_dir'], epochs, n_recent)
 
-            # Reconstruction metric trends (row 3)
+            # Reconstruction metric trends
             if has_recon:
                 eval_epochs = self.history['eval_epochs']
-                axes[2, 0].plot(eval_epochs, self.history['val_dir_ang_p68'],
+                ax_recon1.plot(eval_epochs, self.history['val_dir_ang_p68'],
                                 'o-', label='p68', markersize=3)
-                axes[2, 0].plot(eval_epochs, self.history['val_dir_ang_p90'],
+                ax_recon1.plot(eval_epochs, self.history['val_dir_ang_p90'],
                                 's-', label='p90', markersize=3)
-                axes[2, 0].set_title('Direction Angle Error (deg)')
-                axes[2, 0].set_xlabel('Epoch')
-                axes[2, 0].legend()
-
-                axes[2, 1].plot(eval_epochs, self.history['val_mid_dist_p68'],
-                                'o-', label='p68', markersize=3)
-                axes[2, 1].plot(eval_epochs, self.history['val_mid_dist_p90'],
-                                's-', label='p90', markersize=3)
-                axes[2, 1].set_title('Midpoint Distance (mm)')
-                axes[2, 1].set_xlabel('Epoch')
-                axes[2, 1].legend()
+                ax_recon1.set_title('Direction Angle Error (deg)')
+                ax_recon1.set_xlabel('Epoch')
+                ax_recon1.legend()
 
             plt.tight_layout()
             path = os.path.join(self.plot_dir, 'training_curves.png')
