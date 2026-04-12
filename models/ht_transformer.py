@@ -510,6 +510,7 @@ class HTTransformer(nn.Module):
         # ── 7. Output heads (with global context pooling) ──
         global_context = global_emb.mean(dim=1)
         global_context = global_context + _masked_mean(wp_emb, batch['wp_mask'])
+        global_context = global_context + _masked_mean(cd_emb, batch['cd_mask'])
 
         q1 = query_emb[:, 0, :] + global_context
         q2 = query_emb[:, 1, :] + global_context

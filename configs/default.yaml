@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3_test"
+mission_name: "ht_transformer_v3"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -40,14 +40,14 @@ model:
   dropout: 0.1
 
   wp_self_layers: 2
-  cd_self_layers: 1
+  cd_self_layers: 2
   fusion_layers: 2            # CD↔WP bidirectional cross-attention fusion layers
 
   num_global_tokens: 8
   num_queries: 2
 
   # v3 CD sparse token config
-  cd_max_tokens: 768          # K_cd
+  cd_max_tokens: 1024          # K_cd
   cd_topk_score: "q_sum"
   cd_feature_dim: 10
 
@@ -103,7 +103,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 1
+  rotation_expand_times: 0
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false
