@@ -1,4 +1,4 @@
-mission_name: "ht_transformer_v3_rotation_2times"
+mission_name: "ht_transformer_v3_rotation_3times"
 output_path: "output"
 detector_type: "CDWP"
 
@@ -41,13 +41,13 @@ model:
 
   wp_self_layers: 2
   cd_self_layers: 1
-  fusion_layers: 1            # CD↔WP bidirectional cross-attention fusion layers
+  fusion_layers: 2            # CD↔WP bidirectional cross-attention fusion layers
 
   num_global_tokens: 8
   num_queries: 2
 
   # v3 CD sparse token config
-  cd_max_tokens: 1024          # K_cd
+  cd_max_tokens: 1400          # K_cd
   cd_topk_score: "q_sum"
   cd_feature_dim: 10
 
@@ -77,8 +77,8 @@ loss:
   name: "endpoint_composite"
   lambda_ep: 1.0
   lambda_mid: 0.5
-  lambda_dir: 0.25
-  lambda_len: 0.05
+  lambda_dir: 0.5
+  lambda_len: 0.25
 
 train:
   optimizer: "adamw"
@@ -105,7 +105,7 @@ train:
   seed: 42
 
 augmentation:
-  rotation_expand_times: 2
+  rotation_expand_times: 3
   use_time_jitter: false
   use_drop_hits: false
   use_noise_injection: false

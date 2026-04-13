@@ -1,0 +1,32 @@
+======================================================================
+Model Architecture Summary (V3)
+======================================================================
+  d_model=128, num_heads=4, d_ff=512, head_dim=32
+  num_global_tokens=8, num_queries=2, cd_max_tokens=1024
+
+  Architecture (V3 Sparse PMT Token + Cross-Attention Fusion):
+    WP projector      : dual-branch [ux,uy,uz]⊕[q,t]
+    CD Hit Projector  : dual-branch [ux,uy,uz]⊕[q_sum,q_max,n_hits,t_first,t_mean,t_late,t_span]
+    CD Time Embedding : Fourier + MLP
+    WP self-attn      : 2 layers
+    CD sparse encoder : 2 layer
+    CrossAttn Fusion  : 2 layers (CD↔WP bidirectional)
+    Late fusion       : Global→[WP,CD], Query→[WP,CD,G]
+    FFN               : Linear(128->512) -> GELU -> Linear(512->128)
+
+  Parameter breakdown:
+    WP Projector      :     12,928
+    CD Hit Projector  :     19,424
+    CD Time Embedding :      8,480
+    WP Time Encoding  :      5,312
+    Type Embedding    :        512
+    Position Encoding :      8,320
+    WP Layers         :    396,032
+    CD Sparse Encoder :    396,032
+    CrossAttn Fusion  :    792,064
+    CrossModal Readout:    396,032
+    Output Heads      :     33,798
+    Learnable Tokens  :      1,280
+    -------------------------------------------
+    Total            :  2,070,214
+======================================================================

@@ -1000,12 +1000,12 @@ class Trainer:
                 ax_recon_dir.set_xlabel('Epoch')
                 ax_recon_dir.legend()
 
-                # Midpoint distance trend (unit sphere)
-                ax_recon_mid.plot(eval_epochs, self.history['val_mid_dist_unit_p68'],
-                                  'o-', label='unit_p68', markersize=3)
-                ax_recon_mid.plot(eval_epochs, self.history['val_mid_dist_unit_p90'],
-                                  's-', label='unit_p90', markersize=3)
-                ax_recon_mid.set_title('Midpoint Distance (unit sphere)')
+                # Midpoint distance trend (physical mm)
+                ax_recon_mid.plot(eval_epochs, self.history['val_mid_dist_p68'],
+                                  'o-', label='p68', markersize=3)
+                ax_recon_mid.plot(eval_epochs, self.history['val_mid_dist_p90'],
+                                  's-', label='p90', markersize=3)
+                ax_recon_mid.set_title('Midpoint Distance (mm)')
                 ax_recon_mid.set_xlabel('Epoch')
                 ax_recon_mid.legend()
 
