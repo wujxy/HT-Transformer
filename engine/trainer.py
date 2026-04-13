@@ -768,11 +768,11 @@ class Trainer:
 
     @torch.no_grad()
     def _predict_val(self) -> dict:
-        """Run full inference on validation set, collecting all predictions."""
-        # Non-main processes skip; caller must handle None return
-        if self.use_accelerate and not self._is_main:
-            return None
+        """Run full inference on validation set, collecting all predictions.
 
+        When using accelerate, all processes run inference on their shard,
+        then gather results to the main process for plotting.
+        """
         model = self.accelerator.unwrap_model(self.model) if self.use_accelerate else self.model
         model.eval()
         all_pred_u1, all_pred_u2 = [], []
@@ -785,21 +785,41 @@ class Trainer:
 
             outputs = model(batch)
 
-            all_pred_u1.append(outputs['pred_u1'].cpu().numpy())
-            all_pred_u2.append(outputs['pred_u2'].cpu().numpy())
-            all_gt_u1.append(batch['u1'].cpu().numpy())
-            all_gt_u2.append(batch['u2'].cpu().numpy())
+            all_pred_u1.append(outputs['pred_u1'])
+            all_pred_u2.append(outputs['pred_u2'])
+            all_gt_u1.append(batch['u1'])
+            all_gt_u2.append(batch['u2'])
             if 'is_in_cd' in batch:
-                all_is_in_cd.append(batch['is_in_cd'].cpu().numpy())
+                all_is_in_cd.append(batch['is_in_cd'])
+
+        # Concatenate local shard results (keep on device for gather)
+        pred_u1 = torch.cat(all_pred_u1, dim=0) if all_pred_u1 else torch.zeros(0, 3, device=self.device)
+        pred_u2 = torch.cat(all_pred_u2, dim=0) if all_pred_u2 else torch.zeros(0, 3, device=self.device)
+        gt_u1 = torch.cat(all_gt_u1, dim=0) if all_gt_u1 else torch.zeros(0, 3, device=self.device)
+        gt_u2 = torch.cat(all_gt_u2, dim=0) if all_gt_u2 else torch.zeros(0, 3, device=self.device)
+        has_is_in_cd = len(all_is_in_cd) > 0
+
+        if self.use_accelerate:
+            # Gather from all processes to get full validation set
+            pred_u1 = self.accelerator.gather(pred_u1)
+            pred_u2 = self.accelerator.gather(pred_u2)
+            gt_u1 = self.accelerator.gather(gt_u1)
+            gt_u2 = self.accelerator.gather(gt_u2)
+            if has_is_in_cd:
+                is_in_cd_tensor = torch.cat(all_is_in_cd, dim=0)
+                is_in_cd_tensor = self.accelerator.gather(is_in_cd_tensor)
+            # Only main process does plotting
+            if not self._is_main:
+                return None
 
         result = {
-            'pred_u1': np.concatenate(all_pred_u1),
-            'pred_u2': np.concatenate(all_pred_u2),
-            'gt_u1': np.concatenate(all_gt_u1),
-            'gt_u2': np.concatenate(all_gt_u2),
+            'pred_u1': pred_u1.cpu().numpy(),
+            'pred_u2': pred_u2.cpu().numpy(),
+            'gt_u1': gt_u1.cpu().numpy(),
+            'gt_u2': gt_u2.cpu().numpy(),
         }
-        if all_is_in_cd:
-            result['is_in_cd'] = np.concatenate(all_is_in_cd)
+        if has_is_in_cd:
+            result['is_in_cd'] = is_in_cd_tensor.cpu().numpy()
         return result
 
     def _eval_and_plot(self, epoch: int):
