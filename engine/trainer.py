@@ -790,7 +790,7 @@ class Trainer:
             all_gt_u1.append(batch['u1'].cpu().numpy())
             all_gt_u2.append(batch['u2'].cpu().numpy())
             if 'is_in_cd' in batch:
-                all_is_in_cd.append(batch['is_in_cd'].numpy())
+                all_is_in_cd.append(batch['is_in_cd'].cpu().numpy())
 
         result = {
             'pred_u1': np.concatenate(all_pred_u1),
