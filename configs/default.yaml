@@ -40,8 +40,8 @@ model:
   dropout: 0.1
 
   wp_self_layers: 2
-  cd_self_layers: 2
-  fusion_layers: 2            # CD↔WP bidirectional cross-attention fusion layers
+  cd_self_layers: 1
+  fusion_layers: 1            # CD↔WP bidirectional cross-attention fusion layers
 
   num_global_tokens: 8
   num_queries: 2

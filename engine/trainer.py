@@ -777,6 +777,7 @@ class Trainer:
         model.eval()
         all_pred_u1, all_pred_u2 = [], []
         all_gt_u1, all_gt_u2 = [], []
+        all_is_in_cd = []
 
         for batch in self.val_loader:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -788,13 +789,18 @@ class Trainer:
             all_pred_u2.append(outputs['pred_u2'].cpu().numpy())
             all_gt_u1.append(batch['u1'].cpu().numpy())
             all_gt_u2.append(batch['u2'].cpu().numpy())
+            if 'is_in_cd' in batch:
+                all_is_in_cd.append(batch['is_in_cd'].numpy())
 
-        return {
+        result = {
             'pred_u1': np.concatenate(all_pred_u1),
             'pred_u2': np.concatenate(all_pred_u2),
             'gt_u1': np.concatenate(all_gt_u1),
             'gt_u2': np.concatenate(all_gt_u2),
         }
+        if all_is_in_cd:
+            result['is_in_cd'] = np.concatenate(all_is_in_cd)
+        return result
 
     def _eval_and_plot(self, epoch: int):
         """Run reconstruction metrics computation and plot distributions."""
@@ -809,10 +815,12 @@ class Trainer:
             return
 
         # Compute metrics
+        is_in_cd = preds.get('is_in_cd', None)
         metrics = compute_training_metrics(
             preds['pred_u1'], preds['pred_u2'],
             preds['gt_u1'], preds['gt_u2'],
             sphere_radius=sphere_radius,
+            is_in_cd=is_in_cd,
         )
 
         # Log key metrics
@@ -824,6 +832,17 @@ class Trainer:
             f"mid_dist_p68={metrics['mid_dist_p68']:.1f}mm "
             f"mid_dist_unit_p68={metrics['mid_dist_unit_p68']:.4f}"
         )
+
+        # Log CD-in / CD-out split metrics if available
+        for region in ['cd_in', 'cd_out']:
+            key_mean = f'{region}_mean_ep_ang_p68'
+            if key_mean in metrics:
+                logger.info(
+                    f"  {region}: "
+                    f"mean_ep_ang_p68={metrics[key_mean]:.2f}deg "
+                    f"dir_ang_p68={metrics.get(f'{region}_dir_ang_p68', float('nan')):.2f}deg "
+                    f"mid_dist_p68={metrics.get(f'{region}_mid_dist_p68', float('nan')):.1f}mm"
+                )
 
         # Store in history for trend plots
         self.history.setdefault('val_mean_ep_ang_p68', []).append(metrics['mean_ep_ang_p68'])

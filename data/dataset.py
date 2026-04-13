@@ -406,6 +406,24 @@ class H5EndpointDataset(Dataset):
             f[km['exit_z']][local_idx],
         ], dtype=np.float32)
 
+        # --- CD intersection flag (invariant under rotation about origin) ---
+        cd_radius = 17700.0
+        d = exit_pt - enter
+        a = np.dot(d, d)
+        if a > 1e-10:
+            b = 2.0 * np.dot(enter, d)
+            c_val = np.dot(enter, enter) - cd_radius ** 2
+            disc = b * b - 4.0 * a * c_val
+            if disc >= 0:
+                sqrt_disc = np.sqrt(disc)
+                t1 = (-b - sqrt_disc) / (2.0 * a)
+                t2 = (-b + sqrt_disc) / (2.0 * a)
+                is_in_cd = bool(t1 <= 1.0 and t2 >= 0.0)
+            else:
+                is_in_cd = False
+        else:
+            is_in_cd = bool(np.linalg.norm(enter) <= cd_radius)
+
         # --- Geometry lookup ---
         positions = self.geo.get_positions_batch(copyno)  # (N, 3)
         unit_vecs = self.geo.get_unit_vectors(copyno)      # (N, 3)
@@ -503,6 +521,7 @@ class H5EndpointDataset(Dataset):
             'u2': torch.from_numpy(u2),                          # (3,)
             'p1': torch.from_numpy(enter),                       # (3,) raw xyz
             'p2': torch.from_numpy(exit_pt),                     # (3,) raw xyz
+            'is_in_cd': is_in_cd,                                # bool: track intersects CD sphere
         }
 
         # --- Cache store ---

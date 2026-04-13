@@ -73,7 +73,8 @@ def compute_endpoint_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
 
 def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
                              gt_u1: np.ndarray, gt_u2: np.ndarray,
-                             sphere_radius: float = 25000.0) -> Dict:
+                             sphere_radius: float = 25000.0,
+                             is_in_cd: np.ndarray = None) -> Dict:
     """
     Compute training-time reconstruction metrics for eval visualization.
 
@@ -86,6 +87,7 @@ def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
         gt_u1: (N, 3) ground truth first endpoint unit vectors
         gt_u2: (N, 3) ground truth second endpoint unit vectors
         sphere_radius: radius in mm for converting unit vectors to physical coords
+        is_in_cd: (N,) bool array, True if track intersects CD sphere (r=17700mm)
 
     Returns:
         Dict with raw arrays and scalar metric summaries
@@ -149,6 +151,28 @@ def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
     result.update(_quantile_summary(ep1_angle, 'ep1_ang'))
     result.update(_quantile_summary(ep2_angle, 'ep2_ang'))
     result.update(_quantile_summary(mean_ep_angle, 'mean_ep_ang'))
+
+    # --- CD-in / CD-out split metrics ---
+    if is_in_cd is not None and len(is_in_cd) == len(pred_u1):
+        result['is_in_cd'] = is_in_cd
+        cd_in = is_in_cd.astype(bool)
+        cd_out = ~cd_in
+        n_in = int(cd_in.sum())
+        n_out = int(cd_out.sum())
+
+        for mask, prefix in [(cd_in, 'cd_in'), (cd_out, 'cd_out')]:
+            n = int(mask.sum())
+            if n > 0:
+                result.update(_quantile_summary(dir_angle[mask], f'{prefix}_dir_ang'))
+                result.update(_quantile_summary(midpoint_dist[mask], f'{prefix}_mid_dist'))
+                result.update(_quantile_summary(mean_ep_angle[mask], f'{prefix}_mean_ep_ang'))
+                result[f'{prefix}_n_events'] = n
+            else:
+                result[f'{prefix}_n_events'] = 0
+
+        logger_msg = f"  CD split: in={n_in}, out={n_out}"
+    else:
+        result['is_in_cd'] = None
 
     return result
 

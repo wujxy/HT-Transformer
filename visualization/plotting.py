@@ -151,9 +151,9 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
     Generate training-time evaluation distribution plots.
 
     Called every eval_every epochs during training. Produces three plots:
-    1. Direction angular error distribution
-    2. Midpoint distance distribution
-    3. Per-endpoint angular error comparison
+    1. Direction angular error distribution (with CD-in/CD-out overlay)
+    2. Midpoint distance distribution (with CD-in/CD-out overlay)
+    3. Per-endpoint angular error comparison (with CD-in/CD-out overlay)
 
     Style follows reference project ModelTrainingPlotter conventions:
     bins=200, histtype='step', linewidth=2, quantile vertical lines.
@@ -170,10 +170,27 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
 
     os.makedirs(output_dir, exist_ok=True)
 
+    is_in_cd = eval_results.get('is_in_cd', None)
+    has_cd_split = is_in_cd is not None and len(is_in_cd) == len(eval_results['dir_angle'])
+    cd_in_mask = is_in_cd.astype(bool) if has_cd_split else None
+    cd_out_mask = ~cd_in_mask if has_cd_split else None
+
     # --- Plot 1: Direction angular error distribution ---
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(eval_results['dir_angle'], bins=200, range=(0, 180),
-            histtype='step', linewidth=2, color='steelblue')
+            histtype='step', linewidth=2, color='steelblue',
+            label=f'All (N={len(eval_results["dir_angle"])})')
+    if has_cd_split:
+        n_in = int(cd_in_mask.sum())
+        n_out = int(cd_out_mask.sum())
+        if n_in > 0:
+            ax.hist(eval_results['dir_angle'][cd_in_mask], bins=200, range=(0, 180),
+                    histtype='step', linewidth=1.5, color='crimson', alpha=0.8,
+                    label=f'CD-in (N={n_in})')
+        if n_out > 0:
+            ax.hist(eval_results['dir_angle'][cd_out_mask], bins=200, range=(0, 180),
+                    histtype='step', linewidth=1.5, color='forestgreen', alpha=0.8,
+                    label=f'CD-out (N={n_out})')
     for q, c, ls in [('p68', 'orange', '--'), ('p90', 'red', '-.'),
                      ('p99', 'darkred', ':')]:
         val = eval_results.get(f'dir_ang_{q}', None)
@@ -183,7 +200,7 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
     ax.set_xlabel('Direction Angular Error (deg)')
     ax.set_ylabel('Count')
     ax.set_title(f'Direction Angle Distribution (Epoch {epoch})')
-    ax.legend()
+    ax.legend(fontsize=8)
     plt.tight_layout()
     path1 = os.path.join(output_dir, f'{prefix}_angle_distribution_epoch{epoch}.png')
     plt.savefig(path1, dpi=150)
@@ -192,7 +209,17 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
     # --- Plot 2: Midpoint distance distribution ---
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(eval_results['midpoint_dist'], bins=200, range=(0, 35000),
-            histtype='step', linewidth=2, color='teal')
+            histtype='step', linewidth=2, color='teal',
+            label=f'All (N={len(eval_results["midpoint_dist"])})')
+    if has_cd_split:
+        if n_in > 0:
+            ax.hist(eval_results['midpoint_dist'][cd_in_mask], bins=200, range=(0, 35000),
+                    histtype='step', linewidth=1.5, color='crimson', alpha=0.8,
+                    label=f'CD-in (N={n_in})')
+        if n_out > 0:
+            ax.hist(eval_results['midpoint_dist'][cd_out_mask], bins=200, range=(0, 35000),
+                    histtype='step', linewidth=1.5, color='forestgreen', alpha=0.8,
+                    label=f'CD-out (N={n_out})')
     for q, c, ls in [('p68', 'orange', '--'), ('p90', 'red', '-.'),
                      ('p99', 'darkred', ':')]:
         val = eval_results.get(f'mid_dist_{q}', None)
@@ -202,7 +229,7 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
     ax.set_xlabel('Midpoint Distance (mm)')
     ax.set_ylabel('Count')
     ax.set_title(f'Midpoint Distance Distribution (Epoch {epoch})')
-    ax.legend()
+    ax.legend(fontsize=8)
     plt.tight_layout()
     path2 = os.path.join(output_dir, f'{prefix}_midpoint_distance_distribution_epoch{epoch}.png')
     plt.savefig(path2, dpi=150)
@@ -216,14 +243,73 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
     ax.hist(eval_results['ep2_angle'], bins=200, range=(0, 180),
             histtype='step', linewidth=2, alpha=0.8, color='tomato',
             label=f'EP2 (med={np.median(eval_results["ep2_angle"]):.2f})')
+    if has_cd_split:
+        if n_in > 0:
+            ax.hist(eval_results['mean_ep_angle'][cd_in_mask], bins=200, range=(0, 180),
+                    histtype='step', linewidth=1.5, color='crimson', alpha=0.6,
+                    label=f'Mean CD-in (med={np.median(eval_results["mean_ep_angle"][cd_in_mask]):.2f})')
+        if n_out > 0:
+            ax.hist(eval_results['mean_ep_angle'][cd_out_mask], bins=200, range=(0, 180),
+                    histtype='step', linewidth=1.5, color='forestgreen', alpha=0.6,
+                    label=f'Mean CD-out (med={np.median(eval_results["mean_ep_angle"][cd_out_mask]):.2f})')
     ax.set_xlabel('Endpoint Angular Error (deg)')
     ax.set_ylabel('Count')
     ax.set_title(f'Per-Endpoint Angle Distribution (Epoch {epoch})')
-    ax.legend()
+    ax.legend(fontsize=8)
     plt.tight_layout()
     path3 = os.path.join(output_dir, f'{prefix}_endpoint_angle_distribution_epoch{epoch}.png')
     plt.savefig(path3, dpi=150)
     plt.close()
+
+    # --- Plot 4: CD-in vs CD-out separate comparison ---
+    if has_cd_split and n_in > 0 and n_out > 0:
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+        # Direction angle
+        ax = axes[0]
+        ax.hist(eval_results['dir_angle'][cd_in_mask], bins=200, range=(0, 180),
+                histtype='step', linewidth=2, color='crimson', density=True,
+                label=f'CD-in (N={n_in}, p68={eval_results.get("cd_in_dir_ang_p68", 0):.2f})')
+        ax.hist(eval_results['dir_angle'][cd_out_mask], bins=200, range=(0, 180),
+                histtype='step', linewidth=2, color='forestgreen', density=True,
+                label=f'CD-out (N={n_out}, p68={eval_results.get("cd_out_dir_ang_p68", 0):.2f})')
+        ax.set_xlabel('Direction Angular Error (deg)')
+        ax.set_ylabel('Normalized Count')
+        ax.set_title('Direction Angle: CD-in vs CD-out')
+        ax.legend(fontsize=8)
+
+        # Midpoint distance
+        ax = axes[1]
+        ax.hist(eval_results['midpoint_dist'][cd_in_mask], bins=200, range=(0, 35000),
+                histtype='step', linewidth=2, color='crimson', density=True,
+                label=f'CD-in (p68={eval_results.get("cd_in_mid_dist_p68", 0):.0f}mm)')
+        ax.hist(eval_results['midpoint_dist'][cd_out_mask], bins=200, range=(0, 35000),
+                histtype='step', linewidth=2, color='forestgreen', density=True,
+                label=f'CD-out (p68={eval_results.get("cd_out_mid_dist_p68", 0):.0f}mm)')
+        ax.set_xlabel('Midpoint Distance (mm)')
+        ax.set_ylabel('Normalized Count')
+        ax.set_title('Midpoint Distance: CD-in vs CD-out')
+        ax.legend(fontsize=8)
+
+        # Mean endpoint angle
+        ax = axes[2]
+        ax.hist(eval_results['mean_ep_angle'][cd_in_mask], bins=200, range=(0, 180),
+                histtype='step', linewidth=2, color='crimson', density=True,
+                label=f'CD-in (p68={eval_results.get("cd_in_mean_ep_ang_p68", 0):.2f})')
+        ax.hist(eval_results['mean_ep_angle'][cd_out_mask], bins=200, range=(0, 180),
+                histtype='step', linewidth=2, color='forestgreen', density=True,
+                label=f'CD-out (p68={eval_results.get("cd_out_mean_ep_ang_p68", 0):.2f})')
+        ax.set_xlabel('Mean Endpoint Angular Error (deg)')
+        ax.set_ylabel('Normalized Count')
+        ax.set_title('Mean EP Angle: CD-in vs CD-out')
+        ax.legend(fontsize=8)
+
+        plt.suptitle(f'CD-in vs CD-out Comparison (Epoch {epoch})', fontsize=12)
+        plt.tight_layout()
+        path4 = os.path.join(output_dir, f'{prefix}_cd_in_out_comparison_epoch{epoch}.png')
+        plt.savefig(path4, dpi=150)
+        plt.close()
+        return path1, path2, path3, path4
 
     return path1, path2, path3
 

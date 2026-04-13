@@ -62,6 +62,7 @@ def _write_split_hdf5(h5_path, tokenized_events, K_cd):
     cd_tokens = np.zeros((N, K_cd, 10), dtype=np.float16)
     cd_mask = np.ones((N, K_cd), dtype=bool)
     labels = np.zeros((N, 12), dtype=np.float16)
+    is_in_cd = np.zeros(N, dtype=bool)
 
     wp_flat_parts = []
     wp_counts = np.zeros(N, dtype=np.int64)
@@ -77,6 +78,9 @@ def _write_split_hdf5(h5_path, tokenized_events, K_cd):
         for j, key in enumerate(['u1', 'u2', 'p1', 'p2']):
             v = ev[key]
             labels[i, j*3:(j+1)*3] = v.numpy().astype(np.float16) if isinstance(v, torch.Tensor) else v.astype(np.float16)
+
+        # CD intersection flag
+        is_in_cd[i] = ev.get('is_in_cd', False)
 
         # WP tokens
         wp = ev['wp_tokens']
@@ -98,6 +102,8 @@ def _write_split_hdf5(h5_path, tokenized_events, K_cd):
                          maxshape=(None, K_cd))
         f.create_dataset('labels', data=labels, dtype='float16',
                          maxshape=(None, 12))
+        f.create_dataset('is_in_cd', data=is_in_cd, dtype='bool',
+                         maxshape=(None,))
         f.create_dataset('wp_offsets', data=wp_offsets, dtype='int64',
                          maxshape=(None,))
         wp_flat = np.concatenate(wp_flat_parts) if wp_flat_parts else np.zeros(0, dtype=np.float16)
@@ -120,6 +126,7 @@ def _append_to_split_hdf5(h5_path, tokenized_events, K_cd):
     cd_tokens = np.zeros((N, K_cd, 10), dtype=np.float16)
     cd_mask = np.ones((N, K_cd), dtype=bool)
     labels = np.zeros((N, 12), dtype=np.float16)
+    is_in_cd = np.zeros(N, dtype=bool)
     wp_flat_parts = []
     wp_counts = np.zeros(N, dtype=np.int64)
 
@@ -131,6 +138,7 @@ def _append_to_split_hdf5(h5_path, tokenized_events, K_cd):
         for j, key in enumerate(['u1', 'u2', 'p1', 'p2']):
             v = ev[key]
             labels[i, j*3:(j+1)*3] = v.numpy().astype(np.float16) if isinstance(v, torch.Tensor) else v.astype(np.float16)
+        is_in_cd[i] = ev.get('is_in_cd', False)
         wp = ev['wp_tokens']
         wp_np = wp.numpy() if isinstance(wp, torch.Tensor) else wp
         n_wp = wp_np.shape[0]
@@ -150,6 +158,8 @@ def _append_to_split_hdf5(h5_path, tokenized_events, K_cd):
         f['cd_mask'][old_N:] = cd_mask
         f['labels'].resize(old_N + N, axis=0)
         f['labels'][old_N:] = labels
+        f['is_in_cd'].resize(old_N + N, axis=0)
+        f['is_in_cd'][old_N:] = is_in_cd
 
         # Append WP tokens
         old_flat_size = f['wp_tokens_flat'].shape[0]
@@ -512,6 +522,7 @@ class SplitDataset(Dataset):
         with h5py.File(h5_path, 'r') as f:
             self._n_events = f['cd_tokens'].shape[0]
             self._wp_offsets = f['wp_offsets'][:]  # (N+1,) int64
+            self._has_is_in_cd = 'is_in_cd' in f
 
     def _ensure_open(self):
         if self._file is None:
@@ -540,11 +551,17 @@ class SplitDataset(Dataset):
         # Labels: one read of 12 floats
         labels = torch.from_numpy(np.array(f['labels'][idx])).float()  # (12,)
 
+        # CD intersection flag (backward compatible: default True if missing)
+        is_in_cd = True
+        if self._has_is_in_cd:
+            is_in_cd = bool(f['is_in_cd'][idx])
+
         return {
             'wp_tokens': wp_tokens,
             'cd_tokens': cd_tokens,
             'cd_mask': cd_mask,
             'labels': labels,
+            'is_in_cd': is_in_cd,
         }
 
     def __del__(self):
@@ -572,6 +589,9 @@ def collate_fn(batch: list) -> Dict[str, torch.Tensor]:
     cd_tokens = torch.stack([b['cd_tokens'] for b in batch])   # (B, K_cd, 10)
     cd_mask = torch.stack([b['cd_mask'] for b in batch])       # (B, K_cd) bool
 
+    # CD intersection flag
+    is_in_cd = torch.tensor([b['is_in_cd'] for b in batch], dtype=torch.bool)
+
     for i, b in enumerate(batch):
         n_wp = b['wp_tokens'].shape[0]
         if n_wp > 0:
@@ -590,6 +610,7 @@ def collate_fn(batch: list) -> Dict[str, torch.Tensor]:
         'u2': labels[:, 3:6],
         'p1': labels[:, 6:9],
         'p2': labels[:, 9:12],
+        'is_in_cd': is_in_cd,
     }
 
 
