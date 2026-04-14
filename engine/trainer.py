@@ -608,6 +608,9 @@ class Trainer:
         total_mid = 0
         total_dir = 0
         total_len = 0
+        total_gate_cd = 0.0
+        total_gate_wp = 0.0
+        n_gate = 0
         n_batches = 0
 
         # Profiling accumulators (ms)
@@ -669,6 +672,10 @@ class Trainer:
             total_mid += loss_dict['loss_mid']
             total_dir += loss_dict['loss_dir']
             total_len += loss_dict['loss_len']
+            if 'gate_weights' in outputs:
+                total_gate_cd += outputs['gate_weights'][:, :, 0].mean().item()
+                total_gate_wp += outputs['gate_weights'][:, :, 1].mean().item()
+                n_gate += 1
             n_batches += 1
             self.global_step += 1
 
@@ -696,13 +703,17 @@ class Trainer:
                 f"for {n_batches} steps)"
             )
 
-        return {
+        result = {
             'loss_total': total_loss / max(1, n_batches),
             'loss_ep': total_ep / max(1, n_batches),
             'loss_mid': total_mid / max(1, n_batches),
             'loss_dir': total_dir / max(1, n_batches),
             'loss_len': total_len / max(1, n_batches),
         }
+        if n_gate > 0:
+            result['gate_cd'] = total_gate_cd / n_gate
+            result['gate_wp'] = total_gate_wp / n_gate
+        return result
 
     @torch.no_grad()
     def _val_epoch(self) -> dict:
@@ -778,6 +789,7 @@ class Trainer:
         all_pred_u1, all_pred_u2 = [], []
         all_gt_u1, all_gt_u2 = [], []
         all_is_in_cd = []
+        all_gate_weights = []
 
         for batch in self.val_loader:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -791,6 +803,8 @@ class Trainer:
             all_gt_u2.append(batch['u2'])
             if 'is_in_cd' in batch:
                 all_is_in_cd.append(batch['is_in_cd'])
+            if 'gate_weights' in outputs:
+                all_gate_weights.append(outputs['gate_weights'])
 
         # Concatenate local shard results (keep on device for gather)
         pred_u1 = torch.cat(all_pred_u1, dim=0) if all_pred_u1 else torch.zeros(0, 3, device=self.device)
@@ -798,6 +812,7 @@ class Trainer:
         gt_u1 = torch.cat(all_gt_u1, dim=0) if all_gt_u1 else torch.zeros(0, 3, device=self.device)
         gt_u2 = torch.cat(all_gt_u2, dim=0) if all_gt_u2 else torch.zeros(0, 3, device=self.device)
         has_is_in_cd = len(all_is_in_cd) > 0
+        has_gate = len(all_gate_weights) > 0
 
         if self.use_accelerate:
             # Gather from all processes to get full validation set
@@ -808,6 +823,9 @@ class Trainer:
             if has_is_in_cd:
                 is_in_cd_tensor = torch.cat(all_is_in_cd, dim=0)
                 is_in_cd_tensor = self.accelerator.gather(is_in_cd_tensor)
+            if has_gate:
+                gate_tensor = torch.cat(all_gate_weights, dim=0)
+                gate_tensor = self.accelerator.gather(gate_tensor)
             # Only main process does plotting
             if not self._is_main:
                 return None
@@ -820,6 +838,8 @@ class Trainer:
         }
         if has_is_in_cd:
             result['is_in_cd'] = is_in_cd_tensor.cpu().numpy()
+        if has_gate:
+            result['gate_weights'] = gate_tensor.cpu().numpy()  # (N, Q, 2)
         return result
 
     def _eval_and_plot(self, epoch: int):
@@ -876,8 +896,10 @@ class Trainer:
         self.history.setdefault('eval_epochs', []).append(epoch + 1)
 
         # Generate distribution plots
+        gate_weights = preds.get('gate_weights', None)
         plot_training_eval_distributions(
-            metrics, self.plot_dir, epoch=epoch + 1, prefix="val"
+            metrics, self.plot_dir, epoch=epoch + 1, prefix="val",
+            gate_weights=gate_weights,
         )
 
     def _save_checkpoint(self, filename: str):

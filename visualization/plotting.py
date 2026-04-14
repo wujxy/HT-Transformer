@@ -146,7 +146,8 @@ def plot_result_distributions(metrics: Dict, output_dir: str):
 
 
 def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
-                                      epoch: int, prefix: str = "val"):
+                                      epoch: int, prefix: str = "val",
+                                      gate_weights: np.ndarray = None):
     """
     Generate training-time evaluation distribution plots.
 
@@ -309,9 +310,73 @@ def plot_training_eval_distributions(eval_results: Dict, output_dir: str,
         path4 = os.path.join(output_dir, f'{prefix}_cd_in_out_comparison_epoch{epoch}.png')
         plt.savefig(path4, dpi=150)
         plt.close()
-        return path1, path2, path3, path4
+        paths = [path1, path2, path3, path4]
+    else:
+        paths = [path1, path2, path3]
 
-    return path1, path2, path3
+    # --- Plot 5: Per-query gate distribution ---
+    if gate_weights is not None and gate_weights.ndim == 3 and gate_weights.shape[-1] == 2:
+        alpha_cd_all = gate_weights[:, :, 0]  # (N, Q)
+        alpha_wp_all = gate_weights[:, :, 1]  # (N, Q)
+        is_in_cd = eval_results.get('is_in_cd', None)
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # EP1 vs EP2 gate values
+        ax = axes[0]
+        ax.scatter(alpha_cd_all[:, 0], alpha_cd_all[:, 1], s=3, alpha=0.3,
+                   c='steelblue', label='alpha_CD')
+        ax.set_xlabel('EP1 alpha_CD')
+        ax.set_ylabel('EP2 alpha_CD')
+        ax.set_title('Per-Query CD Gate: EP1 vs EP2')
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
+        ax.legend()
+
+        # CD-in vs CD-out gate distribution
+        ax = axes[1]
+        if is_in_cd is not None and len(is_in_cd) == len(alpha_cd_all):
+            cd_in = is_in_cd.astype(bool)
+            cd_out = ~cd_in
+            ax.hist(alpha_cd_all[cd_in].flatten(), bins=50, range=(0, 1),
+                    alpha=0.6, density=True, color='crimson',
+                    label=f'CD-in (N={cd_in.sum()})')
+            ax.hist(alpha_cd_all[cd_out].flatten(), bins=50, range=(0, 1),
+                    alpha=0.6, density=True, color='forestgreen',
+                    label=f'CD-out (N={cd_out.sum()})')
+        else:
+            ax.hist(alpha_cd_all.flatten(), bins=50, range=(0, 1),
+                    alpha=0.7, color='steelblue', label='All')
+        ax.set_xlabel('alpha_CD (softmax weight)')
+        ax.set_ylabel('Normalized Count')
+        ax.set_title('CD Gate Weight Distribution')
+        ax.legend(fontsize=8)
+
+        # EP1 vs EP2 alpha_CD scatter colored by CD-in/out
+        ax = axes[2]
+        if is_in_cd is not None and len(is_in_cd) == len(alpha_cd_all):
+            cd_in = is_in_cd.astype(bool)
+            cd_out = ~cd_in
+            ax.scatter(alpha_cd_all[cd_in, 0], alpha_cd_all[cd_in, 1],
+                       s=3, alpha=0.3, c='crimson', label='CD-in')
+            ax.scatter(alpha_cd_all[cd_out, 0], alpha_cd_all[cd_out, 1],
+                       s=3, alpha=0.3, c='forestgreen', label='CD-out')
+        else:
+            ax.scatter(alpha_cd_all[:, 0], alpha_cd_all[:, 1],
+                       s=3, alpha=0.3, c='steelblue')
+        ax.set_xlabel('EP1 alpha_CD')
+        ax.set_ylabel('EP2 alpha_CD')
+        ax.set_title('EP1 vs EP2 CD Gate (colored by CD-in/out)')
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
+        ax.legend(fontsize=8)
+
+        plt.suptitle(f'Per-Query Gate Analysis (Epoch {epoch})', fontsize=12)
+        plt.tight_layout()
+        path5 = os.path.join(output_dir, f'{prefix}_gate_distribution_epoch{epoch}.png')
+        plt.savefig(path5, dpi=150)
+        plt.close()
+        paths.append(path5)
+
+    return tuple(paths)
 
 
 def plot_event_3d(pred_u1: np.ndarray, pred_u2: np.ndarray,

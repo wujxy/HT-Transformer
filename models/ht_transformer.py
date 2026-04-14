@@ -281,6 +281,32 @@ def _masked_mean(emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (emb * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
 
+class QueryGate(nn.Module):
+    """Per-query dual-branch gate: each query independently weights CD vs WP.
+
+    Produces softmax weights [alpha_cd, alpha_wp] per query token,
+    allowing EP1 (entry) and EP2 (exit) to rely on different modalities.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 2),
+        )
+
+    def forward(self, query_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query_emb: (B, Q, D) query tokens
+        Returns:
+            weights: (B, Q, 2) softmax weights [alpha_cd, alpha_wp]
+        """
+        return F.softmax(self.gate_mlp(query_emb), dim=-1)
+
+
 class EndpointHead(nn.Module):
     """Predicts a single unit vector endpoint from a query token."""
 
@@ -422,6 +448,15 @@ class HTTransformer(nn.Module):
             norm_type=self.norm_type,
         )
 
+        # Per-query dual-branch gate + branch-specific attention
+        self.query_gate = QueryGate(self.d_model, dropout=model_cfg.get('dropout', 0.1))
+        self.query_cd_norm = _get_norm(self.norm_type, self.d_model)
+        self.query_cd_attn = MultiHeadAttention(self.d_model, model_cfg['num_heads'],
+                                                 model_cfg.get('dropout', 0.1))
+        self.query_wp_norm = _get_norm(self.norm_type, self.d_model)
+        self.query_wp_attn = MultiHeadAttention(self.d_model, model_cfg['num_heads'],
+                                                 model_cfg.get('dropout', 0.1))
+
         # Output heads
         self.head1 = EndpointHead(self.d_model, dropout=model_cfg.get('dropout', 0.1))
         self.head2 = EndpointHead(self.d_model, dropout=model_cfg.get('dropout', 0.1))
@@ -507,18 +542,33 @@ class HTTransformer(nn.Module):
 
         global_emb, query_emb = self.readout(wp_emb, cd_emb, global_emb, query_emb, readout_mask_pack)
 
-        # ── 7. Output heads (with global context pooling) ──
-        global_context = global_emb.mean(dim=1)
-        global_context = global_context + _masked_mean(wp_emb, batch['wp_mask'])
-        global_context = global_context + _masked_mean(cd_emb, batch['cd_mask'])
+        # ── 8. Per-query dual-branch gated readout ──
+        gate_weights = self.query_gate(query_emb)   # (B, Q, 2) — [alpha_cd, alpha_wp]
 
-        q1 = query_emb[:, 0, :] + global_context
-        q2 = query_emb[:, 1, :] + global_context
+        # Query 从 CD 和 WP 分别 readout
+        cd_attn_mask = cd_mask.unsqueeze(1).expand(-1, Q, -1)  # (B, Q, K_cd)
+        wp_attn_mask = wp_mask.unsqueeze(1).expand(-1, Q, -1)  # (B, Q, N_wp)
 
-        pred_u1 = self.head1(q1)
-        pred_u2 = self.head2(q2)
+        q_cd = query_emb + self.query_cd_attn(
+            self.query_cd_norm(query_emb), cd_emb, cd_emb, mask=cd_attn_mask)
+        q_wp = query_emb + self.query_wp_attn(
+            self.query_wp_norm(query_emb), wp_emb, wp_emb, mask=wp_attn_mask)
+
+        # 门控加权
+        alpha_cd = gate_weights[:, :, 0:1]  # (B, Q, 1)
+        alpha_wp = gate_weights[:, :, 1:2]  # (B, Q, 1)
+        q_gated = alpha_cd * q_cd + alpha_wp * q_wp  # (B, Q, D)
+
+        # 加上 global context（global token 均值作为基底）
+        global_context = global_emb.mean(dim=1)  # (B, D)
+        q_gated = q_gated + global_context.unsqueeze(1)  # (B, Q, D)
+
+        # ── 9. Output heads ──
+        pred_u1 = self.head1(q_gated[:, 0, :])
+        pred_u2 = self.head2(q_gated[:, 1, :])
 
         return {
             'pred_u1': pred_u1,
             'pred_u2': pred_u2,
+            'gate_weights': gate_weights,  # (B, Q, 2)
         }
