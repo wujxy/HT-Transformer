@@ -476,12 +476,8 @@ class H5EndpointDataset(Dataset):
             cd_time = cd_time[cd_keep]
 
         # --- Normalize ---
-        # Charge: CD/WP separate
-        norm_cd_q = Normalizer.normalize_charge(cd_charge, apply_log=True) if len(cd_charge) > 0 else np.array([], dtype=np.float32)
+        # WP charge & time (CD normalization is done inside build_v3_cd_tokens)
         norm_wp_q = Normalizer.normalize_charge(wp_charge, apply_log=True) if len(wp_charge) > 0 else np.array([], dtype=np.float32)
-
-        # Time: unified clip + normalize
-        norm_cd_t = Normalizer.normalize_time(cd_time, self.t_max) if len(cd_time) > 0 else np.array([], dtype=np.float32)
         norm_wp_t = Normalizer.normalize_time(wp_time, self.t_max) if len(wp_time) > 0 else np.array([], dtype=np.float32)
 
         # --- WP tokens: [ux, uy, uz, q, t] ---
@@ -562,6 +558,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     u2 = torch.zeros(B, 3)
     p1 = torch.zeros(B, 3)
     p2 = torch.zeros(B, 3)
+    is_in_cd = torch.tensor([b['is_in_cd'] for b in batch], dtype=torch.bool)
 
     for i, b in enumerate(batch):
         n_wp = b['wp_tokens'].shape[0]
@@ -588,6 +585,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         'u2': u2,
         'p1': p1,
         'p2': p2,
+        'is_in_cd': is_in_cd,
     }
 
 

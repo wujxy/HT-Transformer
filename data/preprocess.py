@@ -522,7 +522,6 @@ class SplitDataset(Dataset):
         with h5py.File(h5_path, 'r') as f:
             self._n_events = f['cd_tokens'].shape[0]
             self._wp_offsets = f['wp_offsets'][:]  # (N+1,) int64
-            self._has_is_in_cd = 'is_in_cd' in f
 
     def _ensure_open(self):
         if self._file is None:
@@ -551,10 +550,8 @@ class SplitDataset(Dataset):
         # Labels: one read of 12 floats
         labels = torch.from_numpy(np.array(f['labels'][idx])).float()  # (12,)
 
-        # CD intersection flag (backward compatible: default True if missing)
-        is_in_cd = True
-        if self._has_is_in_cd:
-            is_in_cd = bool(f['is_in_cd'][idx])
+        # CD intersection flag
+        is_in_cd = bool(f['is_in_cd'][idx])
 
         return {
             'wp_tokens': wp_tokens,

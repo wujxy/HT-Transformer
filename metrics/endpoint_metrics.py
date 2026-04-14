@@ -170,7 +170,6 @@ def compute_training_metrics(pred_u1: np.ndarray, pred_u2: np.ndarray,
             else:
                 result[f'{prefix}_n_events'] = 0
 
-        logger_msg = f"  CD split: in={n_in}, out={n_out}"
     else:
         result['is_in_cd'] = None
 
@@ -218,9 +217,12 @@ def evaluate_model(model, dataloader, device, config) -> Dict:
     from models.losses.endpoint_loss import EndpointLoss
 
     model.eval()
+    loss_cfg = config['loss']
     criterion = EndpointLoss(
-        lambda_len=config['loss']['lambda_len'],
-        lambda_dir=config['loss']['lambda_dir'],
+        lambda_ep=loss_cfg.get('lambda_ep', 1.0),
+        lambda_mid=loss_cfg.get('lambda_mid', 0.5),
+        lambda_dir=loss_cfg.get('lambda_dir', 0.25),
+        lambda_len=loss_cfg.get('lambda_len', 0.05),
     )
 
     all_pred_u1 = []
