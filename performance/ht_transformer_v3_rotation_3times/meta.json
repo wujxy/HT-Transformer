@@ -1,0 +1,25 @@
+{
+  "format": "split_hdf5_v3",
+  "cd_representation": "sparse_pmt_precomputed",
+  "cd_max_tokens": 1400,
+  "cd_topk_score": "q_sum",
+  "cd_feature_dim": 10,
+  "cd_feature_order": [
+    "ux",
+    "uy",
+    "uz",
+    "q_sum",
+    "q_max",
+    "n_hits",
+    "t_first",
+    "t_mean",
+    "t_late",
+    "t_span"
+  ],
+  "train_events": 216051,
+  "val_events": 12000,
+  "test_events": 12006,
+  "original_events": 80019,
+  "expand_times": 3,
+  "config_hash": "26b10eb7"
+}
