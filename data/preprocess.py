@@ -353,13 +353,10 @@ def preprocess(config: dict):
         return n
 
     # Write train — skip if already done
-    # When expand_times >= 1: only tokenize rotated samples (skip biased originals)
+    # When expand_times >= 1: tokenize originals + expand_times rotated copies
     # When expand_times == 0: tokenize original samples (no augmentation)
     train_h5_path = os.path.join(preprocessed_dir, 'train.h5')
-    if expand_times >= 1:
-        expected_train_total = len(train_idx) * expand_times
-    else:
-        expected_train_total = len(train_idx)
+    expected_train_total = len(train_idx) * (expand_times + 1)
     skip_train = False
 
     if os.path.exists(train_h5_path):
@@ -381,8 +378,26 @@ def preprocess(config: dict):
                 apply_rotation=False,
             )
         else:
-            # With augmentation: only tokenize rotated samples (skip biased originals)
-            n_train_total = 0
+            # With augmentation: original + rotated copies
+            # 1) Original samples
+            orig_events = []
+            ds = H5EndpointDataset(
+                h5_files, config, geometry,
+                indices=train_idx, is_train=False,
+                events_per_file=events_per_file,
+                apply_rotation_aug=False,
+            )
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, collate_fn=_identity_collate,
+                pin_memory=False, prefetch_factor=prefetch,
+                persistent_workers=False,
+            )
+            for batch_data in tqdm(loader, desc="Tokenizing train originals"):
+                orig_events.extend(batch_data)
+            n_train_total = _write_split_hdf5(train_h5_path, orig_events, K_cd)
+
+            # 2) Rotated copies
             for exp in range(expand_times):
                 logger.info(f"Rotation augmentation {exp+1}/{expand_times}...")
                 aug_events = []
@@ -401,12 +416,9 @@ def preprocess(config: dict):
                 for batch_data in tqdm(loader, desc=f"Rotation {exp+1}/{expand_times}"):
                     aug_events.extend(batch_data)
 
-                if exp == 0:
-                    n_train_total = _write_split_hdf5(train_h5_path, aug_events, K_cd)
-                else:
-                    _append_to_split_hdf5(train_h5_path, aug_events, K_cd)
-                    n_train_total += len(aug_events)
-            logger.info(f"  train (rotation only): {n_train_total} events")
+                _append_to_split_hdf5(train_h5_path, aug_events, K_cd)
+                n_train_total += len(aug_events)
+            logger.info(f"  train (original + rotation): {n_train_total} events")
 
     # --- Val: same pattern as train ---
     val_h5_path = os.path.join(preprocessed_dir, 'val.h5')
@@ -417,7 +429,25 @@ def preprocess(config: dict):
             apply_rotation=False,
         )
     else:
-        n_val_total = 0
+        # 1) Original samples
+        orig_events = []
+        ds = H5EndpointDataset(
+            h5_files, config, geometry,
+            indices=val_idx, is_train=False,
+            events_per_file=events_per_file,
+            apply_rotation_aug=False,
+        )
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=_identity_collate,
+            pin_memory=False, prefetch_factor=prefetch,
+            persistent_workers=False,
+        )
+        for batch_data in tqdm(loader, desc="Tokenizing val originals"):
+            orig_events.extend(batch_data)
+        n_val_total = _write_split_hdf5(val_h5_path, orig_events, K_cd)
+
+        # 2) Rotated copies
         for exp in range(expand_times):
             logger.info(f"Val rotation augmentation {exp+1}/{expand_times}...")
             aug_events = []
@@ -435,12 +465,9 @@ def preprocess(config: dict):
             )
             for batch_data in tqdm(loader, desc=f"Val rotation {exp+1}/{expand_times}"):
                 aug_events.extend(batch_data)
-            if exp == 0:
-                n_val_total = _write_split_hdf5(val_h5_path, aug_events, K_cd)
-            else:
-                _append_to_split_hdf5(val_h5_path, aug_events, K_cd)
-                n_val_total += len(aug_events)
-        logger.info(f"  val (rotation only): {n_val_total} events")
+            _append_to_split_hdf5(val_h5_path, aug_events, K_cd)
+            n_val_total += len(aug_events)
+        logger.info(f"  val (original + rotation): {n_val_total} events")
 
     # --- Test: same pattern as train ---
     test_h5_path = os.path.join(preprocessed_dir, 'test.h5')
@@ -451,7 +478,25 @@ def preprocess(config: dict):
             apply_rotation=False,
         )
     else:
-        n_test_total = 0
+        # 1) Original samples
+        orig_events = []
+        ds = H5EndpointDataset(
+            h5_files, config, geometry,
+            indices=test_idx, is_train=False,
+            events_per_file=events_per_file,
+            apply_rotation_aug=False,
+        )
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=_identity_collate,
+            pin_memory=False, prefetch_factor=prefetch,
+            persistent_workers=False,
+        )
+        for batch_data in tqdm(loader, desc="Tokenizing test originals"):
+            orig_events.extend(batch_data)
+        n_test_total = _write_split_hdf5(test_h5_path, orig_events, K_cd)
+
+        # 2) Rotated copies
         for exp in range(expand_times):
             logger.info(f"Test rotation augmentation {exp+1}/{expand_times}...")
             aug_events = []
@@ -469,12 +514,9 @@ def preprocess(config: dict):
             )
             for batch_data in tqdm(loader, desc=f"Test rotation {exp+1}/{expand_times}"):
                 aug_events.extend(batch_data)
-            if exp == 0:
-                n_test_total = _write_split_hdf5(test_h5_path, aug_events, K_cd)
-            else:
-                _append_to_split_hdf5(test_h5_path, aug_events, K_cd)
-                n_test_total += len(aug_events)
-        logger.info(f"  test (rotation only): {n_test_total} events")
+            _append_to_split_hdf5(test_h5_path, aug_events, K_cd)
+            n_test_total += len(aug_events)
+        logger.info(f"  test (original + rotation): {n_test_total} events")
 
     # --- Save metadata ---
     meta = {
